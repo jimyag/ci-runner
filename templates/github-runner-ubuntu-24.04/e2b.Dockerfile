@@ -1,4 +1,5 @@
-FROM --platform=linux/amd64 ubuntu:24.04
+ARG BASE_PLATFORM=linux/amd64
+FROM --platform=$BASE_PLATFORM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUNNER_VERSION=2.334.0
@@ -61,6 +62,10 @@ RUN set -eux; \
       -o /tmp/actions-runner.tar.gz; \
     tar xzf /tmp/actions-runner.tar.gz -C /opt/actions-runner; \
     rm /tmp/actions-runner.tar.gz; \
+    /opt/actions-runner/bin/installdependencies.sh; \
+    test -x /opt/actions-runner/config.sh; \
+    test -x /opt/actions-runner/run.sh; \
+    rm -rf /var/lib/apt/lists/*; \
     chown -R user:user /opt/actions-runner
 
 WORKDIR /tmp

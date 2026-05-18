@@ -226,7 +226,6 @@ func (s *Server) startRunner(ctx context.Context, id string) {
 		RepositoryURL:     s.gh.RunnerURL(),
 		RegistrationToken: token.Token,
 		Labels:            req.Labels,
-		RunnerVersion:     s.cfg.RunnerVersion,
 		TemplateID:        s.cfg.SandboxTemplateID,
 		Timeout:           s.cfg.SandboxTimeout,
 		OnStdout:          func(data []byte) { s.store.AppendLog(id, "stdout.log", data) },

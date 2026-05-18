@@ -9,7 +9,7 @@ It intentionally does not copy the full GitHub-hosted Ubuntu 24.04 image. The of
 - `gawk`, because the GitHub runner update script uses `awk`.
 - Python 3 and Node.js/npm for common Actions runtime needs.
 - A writable `user` account and writable temp-backed runner homes.
-- Preinstalled GitHub Actions runner package under `/opt/actions-runner`.
+- Preinstalled GitHub Actions runner package and runtime dependencies under `/opt/actions-runner`.
 - Writable tool cache directory under `/opt/hostedtoolcache`.
 
 Reference:
@@ -35,18 +35,18 @@ The build prints a template ID and template name. Use the production template na
 
 ```bash
 export SANDBOX_TEMPLATE_ID="<template-id>"
-export RUNNER_VERSION="2.334.0"
 ```
 
 Do not use `e2b template build -d e2b.Dockerfile` for this template; that command uses E2B's deprecated v1 build system.
 
-The Dockerfile pins the base image with:
+The Dockerfile defaults the base image platform with:
 
 ```dockerfile
-FROM --platform=linux/amd64 ubuntu:24.04
+ARG BASE_PLATFORM=linux/amd64
+FROM --platform=$BASE_PLATFORM ubuntu:24.04
 ```
 
-and installs the `actions-runner-linux-x64` package. This is intentional because the sandbox runtime expects Linux amd64; do not switch it to arm64 for local Mac builds.
+and installs the `actions-runner-linux-x64` package plus its Linux runtime dependencies. This is intentional because the sandbox runtime expects Linux amd64; do not switch it to arm64 for local Mac builds.
 
 ## Smoke Test
 
@@ -63,7 +63,7 @@ runs-on: [self-hosted, e2b]
 
 ## Notes
 
-The runner service copies `/opt/actions-runner` into `/tmp/actions-runner` when present. This avoids downloading the runner tarball for every job.
+The runner service requires `/opt/actions-runner/config.sh` and `/opt/actions-runner/run.sh` to exist and copies `/opt/actions-runner` into `/tmp/actions-runner`. It does not download the runner tarball at runtime.
 
 The runner service also sets:
 

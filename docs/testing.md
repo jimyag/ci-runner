@@ -33,7 +33,6 @@ export GITHUB_ORG="<org name>"
 export HTTP_ADDR=":8080"
 export STATE_DIR="./var/runners"
 export RUNNER_LABELS="self-hosted,e2b"
-export RUNNER_VERSION="2.334.0"
 export SANDBOX_TIMEOUT_SECONDS="3600"
 export MAX_CONCURRENT_RUNNERS="1"
 ```

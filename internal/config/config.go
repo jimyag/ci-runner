@@ -22,7 +22,6 @@ type Config struct {
 	GitHubRepo           string
 	SandboxTemplateID    string
 	RunnerLabels         []string
-	RunnerVersion        string
 	SandboxTimeout       time.Duration
 	MaxConcurrentRunners int
 	GitHubAPIBaseURL     string
@@ -43,7 +42,6 @@ func Load() (Config, error) {
 		GitHubRepo:           os.Getenv("GITHUB_REPO"),
 		SandboxTemplateID:    os.Getenv("SANDBOX_TEMPLATE_ID"),
 		RunnerLabels:         splitLabels(env("RUNNER_LABELS", "self-hosted,e2b")),
-		RunnerVersion:        env("RUNNER_VERSION", "2.334.0"),
 		SandboxTimeout:       time.Duration(envInt("SANDBOX_TIMEOUT_SECONDS", 3600)) * time.Second,
 		MaxConcurrentRunners: envInt("MAX_CONCURRENT_RUNNERS", 1),
 		GitHubAPIBaseURL:     env("GITHUB_API_BASE_URL", "https://api.github.com"),

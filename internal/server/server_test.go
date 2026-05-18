@@ -107,7 +107,6 @@ func newTestServer(store *state.Store, ghURL string, fake *fakeSandbox) http.Han
 		GitHubRepo:           "r",
 		SandboxTemplateID:    "base",
 		RunnerLabels:         []string{"self-hosted", "e2b"},
-		RunnerVersion:        "2.329.0",
 		SandboxTimeout:       time.Hour,
 		MaxConcurrentRunners: 10,
 		GitHubAPIBaseURL:     ghURL,

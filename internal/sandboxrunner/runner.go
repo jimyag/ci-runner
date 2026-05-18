@@ -2,6 +2,7 @@ package sandboxrunner
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"net/http"
 	"strings"
@@ -16,7 +17,6 @@ type StartInput struct {
 	RepositoryURL     string
 	RegistrationToken string
 	Labels            []string
-	RunnerVersion     string
 	TemplateID        string
 	Timeout           time.Duration
 	OnStdout          func([]byte)
@@ -44,6 +44,9 @@ type Service interface {
 type E2BService struct {
 	client *qnsandbox.Client
 }
+
+//go:embed scripts/start-github-runner.sh
+var startRunnerScriptTemplate string
 
 func NewE2BService(apiKey, endpoint string, httpClient *http.Client) (*E2BService, error) {
 	cfg := &qnsandbox.Config{APIKey: apiKey, Endpoint: endpoint, HTTPClient: httpClient}
@@ -121,42 +124,5 @@ func (s *E2BService) StopRunner(ctx context.Context, sandboxID string, pid uint3
 
 func startScript(input StartInput) string {
 	labels := strings.Join(input.Labels, ",")
-	return fmt.Sprintf(`#!/usr/bin/env bash
-set -euo pipefail
-
-export RUNNER_ALLOW_RUNASROOT=1
-export HOME="${RUNNER_HOME:-/tmp/runner-home}"
-export XDG_CONFIG_HOME="${HOME}/.config"
-workdir="${RUNNER_WORKDIR:-/tmp/actions-runner}"
-mkdir -p "$workdir" "$HOME" "$XDG_CONFIG_HOME/git"
-cd "$workdir"
-
-if [ ! -x ./config.sh ]; then
-  if [ -x /opt/actions-runner/config.sh ]; then
-    echo "copying preinstalled GitHub Actions runner"
-    cp -a /opt/actions-runner/. "$workdir"/
-  else
-    arch="$(uname -m)"
-    case "$arch" in
-      x86_64|amd64) runner_arch="x64" ;;
-      aarch64|arm64) runner_arch="arm64" ;;
-      *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
-    esac
-    echo "downloading GitHub Actions runner ${runner_arch} v%[1]s"
-    url="https://github.com/actions/runner/releases/download/v%[1]s/actions-runner-linux-${runner_arch}-%[1]s.tar.gz"
-    curl -fL --show-error --connect-timeout 15 --max-time 300 --retry 3 --retry-delay 2 "$url" -o actions-runner.tar.gz
-    echo "extracting GitHub Actions runner"
-    tar xzf actions-runner.tar.gz
-  fi
-fi
-
-echo "configuring GitHub Actions runner %[4]s"
-./config.sh --url %[2]q --token %[3]q --name %[4]q --labels %[5]q --ephemeral --unattended --replace --disableupdate
-cleanup() {
-  ./config.sh remove --token %[3]q || true
-}
-trap cleanup EXIT
-echo "starting GitHub Actions runner"
-exec ./run.sh
-`, input.RunnerVersion, input.RepositoryURL, input.RegistrationToken, input.RunnerName, labels)
+	return fmt.Sprintf(startRunnerScriptTemplate, input.RepositoryURL, input.RegistrationToken, input.RunnerName, labels)
 }
