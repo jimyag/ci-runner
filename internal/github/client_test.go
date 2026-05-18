@@ -54,7 +54,7 @@ func TestCreateRegistrationToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "gh-token", "o", "r", ts.Client())
+	client := NewClient(ts.URL, "gh-token", "repo", "o", "", "r", ts.Client())
 	token, err := client.CreateRegistrationToken(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -73,8 +73,32 @@ func TestCreateRegistrationTokenFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "bad-token", "o", "r", ts.Client())
+	client := NewClient(ts.URL, "bad-token", "repo", "o", "", "r", ts.Client())
 	if _, err := client.CreateRegistrationToken(t.Context()); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestCreateOrgRegistrationToken(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/orgs/my-org/actions/runners/registration-token" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "gh-token", "org", "", "my-org", "", ts.Client())
+	token, err := client.CreateRegistrationToken(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.Token != "runner-token" {
+		t.Fatalf("unexpected token: %q", token.Token)
+	}
+	if got := client.RunnerURL(); got != "https://github.com/my-org" {
+		t.Fatalf("unexpected runner url: %s", got)
 	}
 }

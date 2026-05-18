@@ -223,7 +223,7 @@ func (s *Server) startRunner(ctx context.Context, id string) {
 	result, err := s.sandbox.StartRunner(ctx, sandboxrunner.StartInput{
 		RequestID:         req.ID,
 		RunnerName:        req.RunnerName,
-		RepositoryURL:     s.gh.RepositoryURL(),
+		RepositoryURL:     s.gh.RunnerURL(),
 		RegistrationToken: token.Token,
 		Labels:            req.Labels,
 		RunnerVersion:     s.cfg.RunnerVersion,

@@ -27,7 +27,7 @@ func main() {
 	}
 	githubHTTPClient := &http.Client{Timeout: 30 * time.Second}
 	sandboxHTTPClient := &http.Client{}
-	gh := github.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, cfg.GitHubOwner, cfg.GitHubRepo, githubHTTPClient)
+	gh := github.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, githubHTTPClient)
 	sb, err := sandboxrunner.NewE2BService(cfg.E2BAPIKey, cfg.E2BAPIURL, sandboxHTTPClient)
 	if err != nil {
 		logger.Error("create sandbox client", "error", err)

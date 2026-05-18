@@ -112,7 +112,7 @@ func newTestServer(store *state.Store, ghURL string, fake *fakeSandbox) http.Han
 		MaxConcurrentRunners: 10,
 		GitHubAPIBaseURL:     ghURL,
 	}
-	gh := github.NewClient(ghURL, "gh-token", "o", "r", http.DefaultClient)
+	gh := github.NewClient(ghURL, "gh-token", "repo", "o", "", "r", http.DefaultClient)
 	return New(cfg, store, gh, fake, nil)
 }
 

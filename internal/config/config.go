@@ -16,7 +16,9 @@ type Config struct {
 	E2BDomain            string
 	GitHubToken          string
 	GitHubWebhookSecret  string
+	RunnerScope          string
 	GitHubOwner          string
+	GitHubOrg            string
 	GitHubRepo           string
 	SandboxTemplateID    string
 	RunnerLabels         []string
@@ -35,7 +37,9 @@ func Load() (Config, error) {
 		E2BDomain:            os.Getenv("E2B_DOMAIN"),
 		GitHubToken:          os.Getenv("GITHUB_TOKEN"),
 		GitHubWebhookSecret:  os.Getenv("GITHUB_WEBHOOK_SECRET"),
+		RunnerScope:          strings.ToLower(env("RUNNER_SCOPE", "repo")),
 		GitHubOwner:          os.Getenv("GITHUB_OWNER"),
+		GitHubOrg:            os.Getenv("GITHUB_ORG"),
 		GitHubRepo:           os.Getenv("GITHUB_REPO"),
 		SandboxTemplateID:    os.Getenv("SANDBOX_TEMPLATE_ID"),
 		RunnerLabels:         splitLabels(env("RUNNER_LABELS", "self-hosted,e2b")),
@@ -51,13 +55,29 @@ func Load() (Config, error) {
 		"E2B_DOMAIN":            cfg.E2BDomain,
 		"GITHUB_TOKEN":          cfg.GitHubToken,
 		"GITHUB_WEBHOOK_SECRET": cfg.GitHubWebhookSecret,
-		"GITHUB_OWNER":          cfg.GitHubOwner,
-		"GITHUB_REPO":           cfg.GitHubRepo,
 		"SANDBOX_TEMPLATE_ID":   cfg.SandboxTemplateID,
 	} {
 		if value == "" {
 			missing = append(missing, name)
 		}
+	}
+	switch cfg.RunnerScope {
+	case "repo":
+		if cfg.GitHubOwner == "" {
+			missing = append(missing, "GITHUB_OWNER")
+		}
+		if cfg.GitHubRepo == "" {
+			missing = append(missing, "GITHUB_REPO")
+		}
+	case "org":
+		if cfg.GitHubOrg == "" {
+			cfg.GitHubOrg = cfg.GitHubOwner
+		}
+		if cfg.GitHubOrg == "" {
+			missing = append(missing, "GITHUB_ORG")
+		}
+	default:
+		return Config{}, fmt.Errorf("RUNNER_SCOPE must be repo or org")
 	}
 	if len(missing) > 0 {
 		return Config{}, fmt.Errorf("missing required env: %s", strings.Join(missing, ", "))

@@ -11,15 +11,19 @@ Required environment variables:
 - `E2B_DOMAIN`
 - `GITHUB_TOKEN`
 - `GITHUB_WEBHOOK_SECRET`
-- `GITHUB_OWNER`
-- `GITHUB_REPO`
 - `SANDBOX_TEMPLATE_ID`
+
+Runner scope:
+
+- Repository runner: set `RUNNER_SCOPE=repo`, `GITHUB_OWNER`, and `GITHUB_REPO`.
+- Organization runner: set `RUNNER_SCOPE=org` and `GITHUB_ORG`.
 
 Optional environment variables:
 
 - `HTTP_ADDR` defaults to `:8080`
 - `STATE_DIR` defaults to `./var/runners`
 - `RUNNER_LABELS` defaults to `self-hosted,e2b`
+- `RUNNER_SCOPE` defaults to `repo`
 - `RUNNER_VERSION` defaults to `2.334.0`
 - `SANDBOX_TIMEOUT_SECONDS` defaults to `3600`
 - `MAX_CONCURRENT_RUNNERS` defaults to `1`

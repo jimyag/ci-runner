@@ -12,10 +12,20 @@ export E2B_API_URL="<e2b api url>"
 export E2B_DOMAIN="<e2b domain>"
 export GITHUB_TOKEN="<github token>"
 export GITHUB_WEBHOOK_SECRET="<random webhook secret>"
+export RUNNER_SCOPE="repo"
 export GITHUB_OWNER="<repo owner>"
 export GITHUB_REPO="<repo name>"
 export SANDBOX_TEMPLATE_ID="<template id>"
 ```
+
+组织级 runner 配置：
+
+```bash
+export RUNNER_SCOPE="org"
+export GITHUB_ORG="<org name>"
+```
+
+`RUNNER_SCOPE=repo` 时，runner 注册到 `https://github.com/<GITHUB_OWNER>/<GITHUB_REPO>`。`RUNNER_SCOPE=org` 时，runner 注册到 `https://github.com/<GITHUB_ORG>`，组织内仓库需要被对应 runner group 允许使用。
 
 可选变量：
 
@@ -30,12 +40,18 @@ export MAX_CONCURRENT_RUNNERS="1"
 
 ## 2. GitHub Token 权限
 
-首版只支持 repository runner。`GITHUB_TOKEN` 需要能调用 repository 级 runner registration token API。
+`GITHUB_TOKEN` 需要能调用对应 scope 的 runner registration token API。
 
-推荐使用 fine-grained personal access token：
+Repository runner 推荐使用 fine-grained personal access token：
 
 - Repository access：只选择目标仓库。
 - Permissions：`Administration` 设为 `Read and write`。
+
+Organization runner 需要组织级 self-hosted runner 管理权限。注册端点是：
+
+```text
+POST /orgs/{org}/actions/runners/registration-token
+```
 
 也可以用 classic PAT，但权限面会更大，不推荐作为长期方案。
 

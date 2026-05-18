@@ -17,7 +17,9 @@ import (
 type Client struct {
 	baseURL string
 	token   string
+	scope   string
 	owner   string
+	org     string
 	repo    string
 	http    *http.Client
 }
@@ -27,25 +29,36 @@ type RegistrationToken struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-func NewClient(baseURL, token, owner, repo string, httpClient *http.Client) *Client {
+func NewClient(baseURL, token, scope, owner, org, repo string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
+	}
+	if org == "" {
+		org = owner
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
+		scope:   scope,
 		owner:   owner,
+		org:     org,
 		repo:    repo,
 		http:    httpClient,
 	}
 }
 
-func (c *Client) RepositoryURL() string {
+func (c *Client) RunnerURL() string {
+	if c.scope == "org" {
+		return fmt.Sprintf("https://github.com/%s", c.org)
+	}
 	return fmt.Sprintf("https://github.com/%s/%s", c.owner, c.repo)
 }
 
 func (c *Client) CreateRegistrationToken(ctx context.Context) (RegistrationToken, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners/registration-token", c.baseURL, c.owner, c.repo)
+	if c.scope == "org" {
+		url = fmt.Sprintf("%s/orgs/%s/actions/runners/registration-token", c.baseURL, c.org)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(nil))
 	if err != nil {
 		return RegistrationToken{}, err
