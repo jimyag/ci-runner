@@ -24,7 +24,6 @@ Optional environment variables:
 - `STATE_DIR` defaults to `./var/runners`
 - `RUNNER_LABELS` defaults to `self-hosted,e2b`
 - `RUNNER_SCOPE` defaults to `repo`
-- `RUNNER_VERSION` defaults to `2.334.0`
 - `SANDBOX_TIMEOUT_SECONDS` defaults to `3600`
 - `MAX_CONCURRENT_RUNNERS` defaults to `1`
 - `GITHUB_API_BASE_URL`
@@ -33,6 +32,23 @@ Optional environment variables:
 
 ```bash
 go run ./cmd/runnerd
+```
+
+## Build
+
+```bash
+task build
+task docker-build
+task template-build-prod
+```
+
+Useful validation commands:
+
+```bash
+task lint
+task test
+task docker-check
+task release-check
 ```
 
 Use `runs-on: [self-hosted, e2b]` in the target workflow. Configure a GitHub webhook for `workflow_job` events pointing at `POST /webhooks/github`.

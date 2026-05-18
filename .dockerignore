@@ -1,7 +1,7 @@
-/runnerd
 bin/
 coverage.txt
 dist/
-var/
 node_modules/
+runnerd
 templates/*/node_modules/
+var/
