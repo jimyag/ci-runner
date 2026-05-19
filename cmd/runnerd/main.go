@@ -7,6 +7,7 @@ import (
 	"os"
 	"time"
 
+	_ "github.com/jimmicro/pprof"
 	"github.com/jimyag/e2b-github-runner/internal/config"
 	"github.com/jimyag/e2b-github-runner/internal/github"
 	"github.com/jimyag/e2b-github-runner/internal/sandboxrunner"
@@ -32,7 +33,20 @@ func main() {
 	}
 	githubHTTPClient := &http.Client{Timeout: 30 * time.Second}
 	sandboxHTTPClient := &http.Client{Timeout: cfg.SandboxAPITimeout}
-	gh := github.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, githubHTTPClient)
+	var gh *github.Client
+	if cfg.GitHubAuthMode() == "app" {
+		gh, err = github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
+			AppID:          cfg.GitHubAppID,
+			InstallationID: cfg.GitHubAppInstallationID,
+			PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
+		}, githubHTTPClient)
+		if err != nil {
+			logger.Error("create github app client", "error", err)
+			os.Exit(1)
+		}
+	} else {
+		gh = github.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, githubHTTPClient)
+	}
 	sb, err := sandboxrunner.NewE2BService(cfg.E2BAPIKey, cfg.E2BAPIURL, sandboxHTTPClient)
 	if err != nil {
 		logger.Error("create sandbox client", "error", err)

@@ -10,7 +10,7 @@ Required environment variables:
 - `E2B_API_URL`
 - `E2B_DOMAIN`
 - `ADMIN_TOKEN`
-- `GITHUB_TOKEN`
+- `GITHUB_TOKEN` (PAT mode) **or** `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY_FILE` (GitHub App mode)
 - `GITHUB_WEBHOOK_SECRET`
 - `SANDBOX_TEMPLATE_ID`
 
@@ -50,6 +50,8 @@ go run ./cmd/runnerd
 Open the embedded admin console at `http://127.0.0.1:25500/admin/`. The UI is built from `ui/` with the same React, Vite, Tailwind CSS, shadcn-style components, and theme tokens used by `kubevirt-console`. It stores `ADMIN_TOKEN` in browser local storage and sends it as `Authorization: Bearer $ADMIN_TOKEN` for management API calls.
 
 The admin console manages runner requests, profiles, repository policies, and profile-match tests. When `RUNNERD_CONFIG_FILE` is provided, `profiles:` and `repository_policies:` are loaded as seed data at startup and then kept in the DB-backed control plane.
+
+The binary also imports `github.com/jimmicro/pprof`, so a local-only pprof/expvar service is started automatically and discovered through generated `.pprof` address files and dump scripts. The admin console exposes a diagnostics page that summarizes the discovered pprof endpoint, `/debug/vars`, DB state, GitHub auth mode, sandbox API configuration, and recent failures.
 
 ![Admin console](docs/images/admin-console.png)
 

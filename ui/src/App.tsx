@@ -87,6 +87,14 @@ type ProfileMatch = {
   reason?: string
 }
 
+type DiagnosticsSummary = {
+  pprof: Array<{ address: string; address_file: string; dump_script: string }>
+  state: { backend: string; database: string }
+  github: { auth_mode: string; installation_id?: number; api_base_url: string }
+  sandbox: { api_url: string; domain: string }
+  recent_failures: RunnerState[]
+}
+
 type Metric = {
   label: string
   value: number
@@ -133,6 +141,8 @@ function App() {
   const [matchRepository, setMatchRepository] = useState("")
   const [matchLabels, setMatchLabels] = useState("self-hosted,e2b")
   const [matchResult, setMatchResult] = useState<ProfileMatch | null>(null)
+  const [diagnostics, setDiagnostics] = useState<DiagnosticsSummary | null>(null)
+  const [diagnosticsVars, setDiagnosticsVars] = useState("")
   const createIDRef = useRef<HTMLInputElement>(null)
 
   const selected = useMemo(
@@ -250,6 +260,22 @@ function App() {
   useEffect(() => {
     if (selectedID) void loadLog(selectedID, selectedLog)
   }, [loadLog, selectedID, selectedLog])
+
+  useEffect(() => {
+    if (section !== "diagnostics" || !token) return
+    void (async () => {
+      try {
+        const [summary, vars] = await Promise.all([
+          request("/diagnostics/pprof"),
+          request("/diagnostics/vars").catch(() => ""),
+        ])
+        setDiagnostics(summary as DiagnosticsSummary)
+        setDiagnosticsVars(typeof vars === "string" ? vars : JSON.stringify(vars, null, 2))
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "Failed to load diagnostics")
+      }
+    })()
+  }, [request, section, token])
 
   const submitToken = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -507,6 +533,7 @@ function App() {
                   <TabsTrigger value="profiles">Profiles</TabsTrigger>
                   <TabsTrigger value="policies">Repository Policies</TabsTrigger>
                   <TabsTrigger value="match">Match Test</TabsTrigger>
+                  <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>
                 </TabsList>
               </Tabs>
             </CardContent>
@@ -1012,6 +1039,66 @@ function App() {
                   ) : (
                     <div className="text-sm text-muted-foreground">No match run yet.</div>
                   )}
+                </CardContent>
+              </Card>
+            </div>
+          ) : null}
+
+          {section === "diagnostics" ? (
+            <div className="grid gap-4 xl:grid-cols-2">
+              <Card>
+                <CardHeader>
+                  <CardTitle>Diagnostics summary</CardTitle>
+                  <CardDescription>DB, GitHub auth, sandbox API, and pprof discovery.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  <Detail label="State backend" value={diagnostics?.state.backend || "-"} />
+                  <Detail label="Database" value={diagnostics?.state.database || "-"} />
+                  <Detail label="GitHub auth" value={diagnostics?.github.auth_mode || "-"} />
+                  <Detail label="Installation" value={diagnostics?.github.installation_id || "-"} />
+                  <Detail label="GitHub API" value={diagnostics?.github.api_base_url || "-"} />
+                  <Detail label="Sandbox API" value={diagnostics?.sandbox.api_url || "-"} />
+                  <Detail label="Sandbox domain" value={diagnostics?.sandbox.domain || "-"} />
+                  <div className="space-y-2">
+                    <div className="text-sm font-medium">pprof endpoints</div>
+                    {diagnostics?.pprof?.length ? (
+                      diagnostics.pprof.map((item) => (
+                        <div key={item.address_file} className="rounded-md border p-3 text-xs">
+                          <div className="font-medium">{item.address}</div>
+                          <div className="text-muted-foreground">{item.address_file}</div>
+                          <div className="text-muted-foreground">{item.dump_script}</div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-sm text-muted-foreground">No pprof artifact discovered yet.</div>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card>
+                <CardHeader>
+                  <CardTitle>Recent failures</CardTitle>
+                  <CardDescription>Latest failed requests plus the current /debug/vars snapshot.</CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="space-y-2">
+                    {diagnostics?.recent_failures?.length ? (
+                      diagnostics.recent_failures.map((failure) => (
+                        <div key={failure.id} className="rounded-md border p-3 text-sm">
+                          <div className="font-medium">{failure.id}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {failure.repository_full_name || "-"} · {failure.profile_name || "-"} ·{" "}
+                            {failure.failure_reason || failure.error || "-"}
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="text-sm text-muted-foreground">No recent failures.</div>
+                    )}
+                  </div>
+                  <pre className="max-h-[48vh] min-h-72 overflow-auto rounded-lg border bg-muted/50 p-3 text-xs leading-relaxed whitespace-pre-wrap">
+                    {diagnosticsVars || "No /debug/vars data available"}
+                  </pre>
                 </CardContent>
               </Card>
             </div>

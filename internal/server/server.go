@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/jimyag/e2b-github-runner/internal/config"
 	"github.com/jimyag/e2b-github-runner/internal/github"
+	"github.com/jimyag/e2b-github-runner/internal/metrics"
 	"github.com/jimyag/e2b-github-runner/internal/sandboxrunner"
 	"github.com/jimyag/e2b-github-runner/internal/state"
 )
@@ -134,6 +137,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /repository-policies", s.handleCreateRepositoryPolicy)
 	s.mux.HandleFunc("PATCH /repository-policies/{id}", s.handlePatchRepositoryPolicy)
 	s.mux.HandleFunc("DELETE /repository-policies/{id}", s.handleDeleteRepositoryPolicy)
+	s.mux.HandleFunc("GET /diagnostics/pprof", s.handleDiagnosticsPprof)
+	s.mux.HandleFunc("GET /diagnostics/vars", s.handleDiagnosticsVars)
 }
 
 func (s *Server) startBackgroundLoops() {
@@ -184,6 +189,18 @@ func (s *Server) processQueuedRequests() {
 			go s.startRunnerWhenSlotAvailable(context.Background(), st.ID)
 		}
 	}
+}
+
+func (s *Server) refreshMetrics() {
+	profiles, err := s.store.ListProfiles()
+	if err != nil {
+		return
+	}
+	states, err := s.store.ListStates()
+	if err != nil {
+		return
+	}
+	metrics.Refresh(profiles, states)
 }
 
 func (s *Server) sweepOnce() {
@@ -307,6 +324,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		req.ProfileName = match.Profile.Name
 		req.RunnerGroup = match.Profile.RunnerGroup
 		req.Labels = append([]string(nil), match.Profile.Labels...)
+		metrics.RecordWorkflowQueued(event.Repository.FullName, event.WorkflowRun.Name, event.WorkflowJob.Name, match.Profile.Name)
 		s.createAndStart(w, r, req, body)
 	case "completed":
 		if !strings.HasPrefix(event.WorkflowJob.RunnerName, "e2b-") {
@@ -315,8 +333,14 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		stopID := strings.TrimPrefix(event.WorkflowJob.RunnerName, "e2b-")
-		s.stopIfExists(context.Background(), stopID, event.WorkflowJob)
-		writeJSON(w, http.StatusAccepted, map[string]string{"status": "stopping"})
+		st, err := s.stopRunner(context.Background(), stopID, event.WorkflowJob)
+		if err != nil {
+			s.logger.Error("stop runner", "id", stopID, "error", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		metrics.RecordWorkflowCompleted(st.RepositoryFullName, event.WorkflowRun.Name, event.WorkflowJob.Name, st.ProfileName, "completed")
+		writeJSON(w, http.StatusAccepted, st)
 	default:
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
 	}
@@ -384,6 +408,7 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdminAuth(w, r) {
 		return
 	}
+	s.refreshMetrics()
 	states, err := s.store.ListStates()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -442,6 +467,7 @@ func (s *Server) handleListProfiles(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdminAuth(w, r) {
 		return
 	}
+	s.refreshMetrics()
 	profiles, err := s.store.ListProfiles()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -477,6 +503,7 @@ func (s *Server) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusCreated, profile)
 }
 
@@ -528,6 +555,7 @@ func (s *Server) handlePatchProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusOK, profile)
 }
 
@@ -539,6 +567,7 @@ func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -546,6 +575,7 @@ func (s *Server) handleListRepositoryPolicies(w http.ResponseWriter, r *http.Req
 	if !s.requireAdminAuth(w, r) {
 		return
 	}
+	s.refreshMetrics()
 	policies, err := s.store.ListRepositoryPolicies()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -576,6 +606,7 @@ func (s *Server) handleCreateRepositoryPolicy(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusCreated, policy)
 }
 
@@ -623,6 +654,7 @@ func (s *Server) handlePatchRepositoryPolicy(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusOK, policy)
 }
 
@@ -639,6 +671,7 @@ func (s *Server) handleDeleteRepositoryPolicy(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.refreshMetrics()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 
@@ -657,6 +690,76 @@ func (s *Server) handleMatchProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, match)
+}
+
+func (s *Server) handleDiagnosticsPprof(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminAuth(w, r) {
+		return
+	}
+	type artifact struct {
+		Address     string `json:"address"`
+		AddressFile string `json:"address_file"`
+		DumpScript  string `json:"dump_script"`
+	}
+	addresses, scripts := discoverPprofArtifacts()
+	states, _ := s.store.ListStates()
+	failures := make([]state.RunnerState, 0, 5)
+	for _, st := range states {
+		if st.Status == state.StatusFailed {
+			failures = append(failures, st)
+			if len(failures) == 5 {
+				break
+			}
+		}
+	}
+	out := make([]artifact, 0, len(addresses))
+	for i := range addresses {
+		item := artifact{Address: addresses[i].Address, AddressFile: addresses[i].Path}
+		if i < len(scripts) {
+			item.DumpScript = scripts[i]
+		}
+		out = append(out, item)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pprof": out,
+		"state": map[string]any{
+			"backend":  "sqlite",
+			"database": filepath.Join(s.cfg.StateDir, "runnerd.db"),
+		},
+		"github": map[string]any{
+			"auth_mode":       s.cfg.GitHubAuthMode(),
+			"installation_id": s.cfg.GitHubAppInstallationID,
+			"api_base_url":    s.cfg.GitHubAPIBaseURL,
+		},
+		"sandbox": map[string]any{
+			"api_url": s.cfg.E2BAPIURL,
+			"domain":  s.cfg.E2BDomain,
+		},
+		"recent_failures": failures,
+	})
+}
+
+func (s *Server) handleDiagnosticsVars(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAdminAuth(w, r) {
+		return
+	}
+	addresses, _ := discoverPprofArtifacts()
+	if len(addresses) == 0 {
+		writeError(w, http.StatusNotFound, "pprof endpoint not discovered")
+		return
+	}
+	resp, err := http.Get(strings.TrimRight(addresses[0].Address, "/") + "/debug/vars")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		writeError(w, http.StatusBadGateway, resp.Status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func (s *Server) createAndStart(w http.ResponseWriter, r *http.Request, req state.RunnerRequest, payload []byte) {
@@ -687,6 +790,7 @@ func (s *Server) createAndStart(w http.ResponseWriter, r *http.Request, req stat
 	if created {
 		s.logger.Info("runner request created", "id", req.ID, "source", req.Source, "labels", req.Labels)
 		s.store.AppendLog(req.ID, "control.log", []byte("runner request created\n"))
+		s.refreshMetrics()
 		s.signalQueue()
 		writeJSON(w, http.StatusAccepted, st)
 		return
@@ -710,6 +814,7 @@ func (s *Server) rejectAdmission(req state.RunnerRequest, payload []byte, reason
 		return state.RunnerState{}, err
 	}
 	s.store.AppendLog(req.ID, "control.log", []byte("runner admission rejected: "+reason+"\n"))
+	s.refreshMetrics()
 	return st, nil
 }
 
@@ -752,6 +857,7 @@ func (s *Server) startRunner(ctx context.Context, id string) {
 
 	s.logger.Info("creating github registration token", "id", id)
 	s.store.AppendLog(id, "control.log", []byte("creating github registration token\n"))
+	createStartedAt := time.Now()
 	token, err := s.gh.CreateRegistrationToken(ctx)
 	if err != nil {
 		s.failState(id, st, err)
@@ -816,6 +922,9 @@ func (s *Server) startRunner(ctx context.Context, id string) {
 	unlock()
 	s.logger.Info("sandbox runner started", "id", id, "sandbox_id", result.SandboxID, "pid", result.PID)
 	s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("sandbox runner started sandbox_id=%s pid=%d\n", result.SandboxID, result.PID)))
+	metrics.RecordCreate(req.ProfileName, time.Since(createStartedAt), "success")
+	metrics.RecordWorkflowStarted(req.RepositoryFullName, "", req.RunnerName, req.ProfileName)
+	s.refreshMetrics()
 	<-exitCh
 }
 
@@ -838,6 +947,8 @@ func (s *Server) failState(id string, st state.RunnerState, err error) {
 	if writeErr := s.store.WriteState(st); writeErr != nil {
 		s.logger.Error("write failed state", "id", id, "error", writeErr)
 	}
+	metrics.RecordCreate(st.ProfileName, 0, "failed")
+	s.refreshMetrics()
 }
 
 func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err error) {
@@ -880,6 +991,7 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 		st.CompletedAt = time.Now().UTC()
 	}
 	s.writeStateOrLog(id, st, "write exited state")
+	s.refreshMetrics()
 }
 
 func (s *Server) cleanupSandboxAfterExit(id string, st state.RunnerState) error {
@@ -933,6 +1045,7 @@ func (s *Server) recoverRunner(ctx context.Context, id string) error {
 		return err
 	}
 	s.store.AppendLog(id, "control.log", []byte("runner marked completed during recovery\n"))
+	s.refreshMetrics()
 	return nil
 }
 
@@ -968,6 +1081,7 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 		st.AssignedJobName = job.Name
 	}
 	st.Status = state.StatusStopping
+	stopStartedAt := time.Now()
 	if err := s.store.WriteState(st); err != nil {
 		return state.RunnerState{}, fmt.Errorf("write stopping state: %w", err)
 	}
@@ -983,6 +1097,8 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 				if writeErr := s.store.WriteState(st); writeErr != nil {
 					return state.RunnerState{}, fmt.Errorf("stop sandbox: %v; write failed state: %w", err, writeErr)
 				}
+				metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "failed")
+				s.refreshMetrics()
 				return st, err
 			}
 		}
@@ -993,6 +1109,8 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 	if err := s.store.WriteState(st); err != nil {
 		return state.RunnerState{}, err
 	}
+	metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
+	s.refreshMetrics()
 	return st, nil
 }
 
@@ -1053,6 +1171,7 @@ func (s *Server) markFailed(st state.RunnerState, stage, reason, message string)
 		return
 	}
 	s.store.AppendLog(st.ID, "control.log", []byte(message+"\n"))
+	s.refreshMetrics()
 }
 
 func isActiveStatus(status string) bool {
@@ -1062,6 +1181,34 @@ func isActiveStatus(status string) bool {
 	default:
 		return false
 	}
+}
+
+type pprofAddress struct {
+	Path    string
+	Address string
+}
+
+func discoverPprofArtifacts() ([]pprofAddress, []string) {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, nil
+	}
+	dir := filepath.Dir(executable)
+	name := filepath.Base(executable)
+	pprofFiles, _ := filepath.Glob(filepath.Join(dir, name+"_*_*.pprof"))
+	scriptFiles, _ := filepath.Glob(filepath.Join(dir, name+"_*_profile_dump.sh"))
+	addresses := make([]pprofAddress, 0, len(pprofFiles))
+	for _, file := range pprofFiles {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		addresses = append(addresses, pprofAddress{
+			Path:    file,
+			Address: strings.TrimSpace(string(data)),
+		})
+	}
+	return addresses, scriptFiles
 }
 
 func (s *Server) lockRunner(id string) func() {

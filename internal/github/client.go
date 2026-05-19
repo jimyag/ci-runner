@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/bradleyfalzon/ghinstallation/v2"
 )
 
 type Client struct {
@@ -22,6 +25,12 @@ type Client struct {
 	org     string
 	repo    string
 	http    *http.Client
+}
+
+type AppAuth struct {
+	AppID          int64
+	InstallationID int64
+	PrivateKeyFile string
 }
 
 type RegistrationToken struct {
@@ -45,6 +54,27 @@ func NewClient(baseURL, token, scope, owner, org, repo string, httpClient *http.
 		repo:    repo,
 		http:    httpClient,
 	}
+}
+
+func NewAppClient(baseURL, scope, owner, org, repo string, auth AppAuth, httpClient *http.Client) (*Client, error) {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	privateKey, err := os.ReadFile(auth.PrivateKeyFile)
+	if err != nil {
+		return nil, err
+	}
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	transport, err := ghinstallation.New(baseTransport, auth.AppID, auth.InstallationID, privateKey)
+	if err != nil {
+		return nil, err
+	}
+	cloned := *httpClient
+	cloned.Transport = transport
+	return NewClient(baseURL, "", scope, owner, org, repo, &cloned), nil
 }
 
 func (c *Client) RunnerURL() string {
