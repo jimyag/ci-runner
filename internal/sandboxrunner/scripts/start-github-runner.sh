@@ -19,6 +19,11 @@ if [ ! -x ./config.sh ]; then
   cp -a /opt/actions-runner/. "$workdir"/
 fi
 
+if [ -x /usr/local/bin/ensure-docker ]; then
+  echo "checking Docker daemon"
+  /usr/local/bin/ensure-docker || true
+fi
+
 echo "configuring GitHub Actions runner %[3]s"
 ./config.sh --url %[1]q --token %[2]q --name %[3]q --labels %[4]q --ephemeral --unattended --replace --disableupdate
 cleanup() {

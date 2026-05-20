@@ -8,6 +8,7 @@ It intentionally does not copy the full GitHub-hosted Ubuntu 24.04 image. The of
 - Core shell, archive, network, build, Git, and Git LFS tools.
 - `gawk`, because the GitHub runner update script uses `awk`.
 - Python 3 and Node.js/npm for common Actions runtime needs.
+- LAS CI tooling preinstalled in the template: Go 1.26.3, Node.js 22, GitHub CLI, Docker CLI/daemon packages, Go Task, gofumpt, goimports, staticcheck 0.7.0, OpenTofu 1.11.5, and Terraform 1.14.6.
 - A writable `user` account and writable temp-backed runner homes.
 - Preinstalled GitHub Actions runner package and runtime dependencies under `/opt/actions-runner`.
 - Writable tool cache directory under `/opt/hostedtoolcache`.
@@ -73,3 +74,5 @@ XDG_CONFIG_HOME=/tmp/runner-home/.config
 ```
 
 This keeps Git config access away from the earlier broken `/home/user/.config` path. Go-specific paths are left to `actions/setup-go` defaults.
+
+For LAS workflows, Docker is installed in the template and the runner startup script calls `/usr/local/bin/ensure-docker` before registering the Actions runner. The helper starts `dockerd` when possible and logs `/tmp/dockerd.log` if the sandbox runtime does not allow a Docker daemon to become ready.
