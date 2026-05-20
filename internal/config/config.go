@@ -3,7 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
-	"strconv"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -16,11 +16,12 @@ type Config struct {
 	HTTPWriteTimeout        time.Duration
 	HTTPIdleTimeout         time.Duration
 	StateDir                string
+	StateBackend            string
+	StateDatabaseURL        string
 	AdminToken              string
 	E2BAPIKey               string
 	E2BAPIURL               string
 	E2BDomain               string
-	GitHubToken             string
 	GitHubAppID             int64
 	GitHubAppInstallationID int64
 	GitHubAppPrivateKeyFile string
@@ -36,122 +37,168 @@ type Config struct {
 	SandboxCreateTimeout    time.Duration
 	SandboxStopTimeout      time.Duration
 	RecoveryTimeout         time.Duration
+	WorkerLeaseTTL          time.Duration
+	RunnerIdleTimeout       time.Duration
+	RetryBaseDelay          time.Duration
+	RetryMaxDelay           time.Duration
+	RetryMaxAttempts        int
 	MaxConcurrentRunners    int
 	GitHubAPIBaseURL        string
-	ConfigFile              string
-	Profiles                []RunnerProfileConfig
-	RepositoryPolicies      []RepositoryPolicyConfig
+	ConfigPath              string
+	RunnerSpecs             []RunnerSpecConfig
+	RunnerGroups            []RunnerGroupConfig
+	RunnerPolicies          []RunnerPolicyConfig
 }
 
-type RunnerProfileConfig struct {
-	Name           string   `yaml:"name"`
-	Labels         []string `yaml:"labels"`
-	TemplateID     string   `yaml:"template_id"`
-	RunnerGroup    string   `yaml:"runner_group"`
-	MaxConcurrency int      `yaml:"max_concurrency"`
-	MinIdle        int      `yaml:"min_idle"`
-	Priority       int      `yaml:"priority"`
-	Enabled        bool     `yaml:"enabled"`
+type RunnerSpecConfig struct {
+	Name             string   `yaml:"name"`
+	Labels           []string `yaml:"labels"`
+	TemplateID       string   `yaml:"template_id"`
+	RunnerGroup      string   `yaml:"runner_group"`
+	MaxConcurrency   int      `yaml:"max_concurrency"`
+	MinIdle          int      `yaml:"min_idle"`
+	Priority         int      `yaml:"priority"`
+	Enabled          bool     `yaml:"enabled"`
+	DefaultAvailable bool     `yaml:"default_available"`
 }
 
-type RepositoryPolicyConfig struct {
-	Repository      string   `yaml:"repository"`
-	AllowedProfiles []string `yaml:"allowed_profiles"`
+type RunnerPolicyConfig struct {
+	Repository    string   `yaml:"repository"`
+	AllowedSpecs  []string `yaml:"allowed_specs"`
+	AllowedGroups []string `yaml:"allowed_groups"`
 }
 
-func Load() (Config, error) {
+type RunnerGroupConfig struct {
+	Name        string   `yaml:"name"`
+	Description string   `yaml:"description"`
+	SpecNames   []string `yaml:"spec_names"`
+	Enabled     bool     `yaml:"enabled"`
+}
+
+type fileConfig struct {
+	Server struct {
+		HTTPAddr        string `yaml:"http_addr"`
+		ReadTimeoutSec  int    `yaml:"read_timeout_seconds"`
+		WriteTimeoutSec int    `yaml:"write_timeout_seconds"`
+		IdleTimeoutSec  int    `yaml:"idle_timeout_seconds"`
+	} `yaml:"server"`
+	Database struct {
+		Backend string `yaml:"backend"`
+		URL     string `yaml:"url"`
+	} `yaml:"database"`
+	Admin struct {
+		Token string `yaml:"token"`
+	} `yaml:"admin"`
+	E2B struct {
+		APIKey           string `yaml:"api_key"`
+		APIURL           string `yaml:"api_url"`
+		Domain           string `yaml:"domain"`
+		TemplateID       string `yaml:"template_id"`
+		TimeoutSec       int    `yaml:"timeout_seconds"`
+		APITimeoutSec    int    `yaml:"api_timeout_seconds"`
+		CreateTimeoutSec int    `yaml:"create_timeout_seconds"`
+		StopTimeoutSec   int    `yaml:"stop_timeout_seconds"`
+	} `yaml:"e2b"`
+	GitHub struct {
+		WebhookSecret string `yaml:"webhook_secret"`
+		APIBaseURL    string `yaml:"api_base_url"`
+		Scope         string `yaml:"scope"`
+		Owner         string `yaml:"owner"`
+		Org           string `yaml:"org"`
+		Repo          string `yaml:"repo"`
+		App           struct {
+			ID             int64  `yaml:"id"`
+			InstallationID int64  `yaml:"installation_id"`
+			PrivateKeyFile string `yaml:"private_key_file"`
+		} `yaml:"app"`
+	} `yaml:"github"`
+	Worker struct {
+		RunnerLabels         []string `yaml:"runner_labels"`
+		MaxConcurrentRunners int      `yaml:"max_concurrent_runners"`
+		RunnerIdleTimeoutSec int      `yaml:"runner_idle_timeout_seconds"`
+		RecoveryTimeoutSec   int      `yaml:"recovery_timeout_seconds"`
+		LeaseTTLSec          int      `yaml:"lease_ttl_seconds"`
+		RetryBaseDelaySec    int      `yaml:"retry_base_delay_seconds"`
+		RetryMaxDelaySec     int      `yaml:"retry_max_delay_seconds"`
+		RetryMaxAttempts     int      `yaml:"retry_max_attempts"`
+	} `yaml:"worker"`
+	RunnerSpecs    []RunnerSpecConfig   `yaml:"runner_specs"`
+	RunnerGroups   []RunnerGroupConfig  `yaml:"runner_groups"`
+	RunnerPolicies []RunnerPolicyConfig `yaml:"runner_policies"`
+}
+
+func Load(path string) (Config, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "runnerd.yaml"
+	}
+	return LoadFile(path)
+}
+
+func LoadFile(path string) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %q: %w", path, err)
+	}
+	var raw fileConfig
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
+	}
 	cfg := Config{
-		HTTPAddr:                env("HTTP_ADDR", ":25500"),
-		HTTPReadTimeout:         time.Duration(envInt("HTTP_READ_TIMEOUT_SECONDS", 15)) * time.Second,
-		HTTPWriteTimeout:        time.Duration(envInt("HTTP_WRITE_TIMEOUT_SECONDS", 60)) * time.Second,
-		HTTPIdleTimeout:         time.Duration(envInt("HTTP_IDLE_TIMEOUT_SECONDS", 120)) * time.Second,
-		StateDir:                env("STATE_DIR", "./var/runners"),
-		AdminToken:              os.Getenv("ADMIN_TOKEN"),
-		E2BAPIKey:               os.Getenv("E2B_API_KEY"),
-		E2BAPIURL:               os.Getenv("E2B_API_URL"),
-		E2BDomain:               os.Getenv("E2B_DOMAIN"),
-		GitHubToken:             os.Getenv("GITHUB_TOKEN"),
-		GitHubAppID:             envInt64("GITHUB_APP_ID", 0),
-		GitHubAppInstallationID: envInt64("GITHUB_APP_INSTALLATION_ID", 0),
-		GitHubAppPrivateKeyFile: os.Getenv("GITHUB_APP_PRIVATE_KEY_FILE"),
-		GitHubWebhookSecret:     os.Getenv("GITHUB_WEBHOOK_SECRET"),
-		RunnerScope:             strings.ToLower(env("RUNNER_SCOPE", "repo")),
-		GitHubOwner:             os.Getenv("GITHUB_OWNER"),
-		GitHubOrg:               os.Getenv("GITHUB_ORG"),
-		GitHubRepo:              os.Getenv("GITHUB_REPO"),
-		SandboxTemplateID:       os.Getenv("SANDBOX_TEMPLATE_ID"),
-		RunnerLabels:            splitLabels(env("RUNNER_LABELS", "self-hosted,e2b")),
-		SandboxTimeout:          time.Duration(envInt("SANDBOX_TIMEOUT_SECONDS", 3600)) * time.Second,
-		SandboxAPITimeout:       time.Duration(envInt("SANDBOX_API_TIMEOUT_SECONDS", 60)) * time.Second,
-		SandboxCreateTimeout:    time.Duration(envInt("SANDBOX_CREATE_TIMEOUT_SECONDS", 120)) * time.Second,
-		SandboxStopTimeout:      time.Duration(envInt("SANDBOX_STOP_TIMEOUT_SECONDS", 30)) * time.Second,
-		RecoveryTimeout:         time.Duration(envInt("RECOVERY_TIMEOUT_SECONDS", 120)) * time.Second,
-		MaxConcurrentRunners:    envInt("MAX_CONCURRENT_RUNNERS", 100),
-		GitHubAPIBaseURL:        env("GITHUB_API_BASE_URL", "https://api.github.com"),
-		ConfigFile:              os.Getenv("RUNNERD_CONFIG_FILE"),
+		HTTPAddr:                defaultString(raw.Server.HTTPAddr, ":25500"),
+		HTTPReadTimeout:         durationSeconds(raw.Server.ReadTimeoutSec, 15),
+		HTTPWriteTimeout:        durationSeconds(raw.Server.WriteTimeoutSec, 60),
+		HTTPIdleTimeout:         durationSeconds(raw.Server.IdleTimeoutSec, 120),
+		StateBackend:            strings.ToLower(defaultString(raw.Database.Backend, "sqlite")),
+		StateDatabaseURL:        raw.Database.URL,
+		AdminToken:              raw.Admin.Token,
+		E2BAPIKey:               raw.E2B.APIKey,
+		E2BAPIURL:               raw.E2B.APIURL,
+		E2BDomain:               raw.E2B.Domain,
+		GitHubAppID:             raw.GitHub.App.ID,
+		GitHubAppInstallationID: raw.GitHub.App.InstallationID,
+		GitHubAppPrivateKeyFile: raw.GitHub.App.PrivateKeyFile,
+		GitHubWebhookSecret:     raw.GitHub.WebhookSecret,
+		RunnerScope:             strings.ToLower(defaultString(raw.GitHub.Scope, "repo")),
+		GitHubOwner:             raw.GitHub.Owner,
+		GitHubOrg:               raw.GitHub.Org,
+		GitHubRepo:              raw.GitHub.Repo,
+		SandboxTemplateID:       raw.E2B.TemplateID,
+		RunnerLabels:            normalizeLabels(raw.Worker.RunnerLabels),
+		SandboxTimeout:          durationSeconds(raw.E2B.TimeoutSec, 3600),
+		SandboxAPITimeout:       durationSeconds(raw.E2B.APITimeoutSec, 60),
+		SandboxCreateTimeout:    durationSeconds(raw.E2B.CreateTimeoutSec, 120),
+		SandboxStopTimeout:      durationSeconds(raw.E2B.StopTimeoutSec, 30),
+		RecoveryTimeout:         durationSeconds(raw.Worker.RecoveryTimeoutSec, 120),
+		WorkerLeaseTTL:          durationSeconds(raw.Worker.LeaseTTLSec, 300),
+		RunnerIdleTimeout:       durationSeconds(raw.Worker.RunnerIdleTimeoutSec, 300),
+		RetryBaseDelay:          durationSeconds(raw.Worker.RetryBaseDelaySec, 15),
+		RetryMaxDelay:           durationSeconds(raw.Worker.RetryMaxDelaySec, 300),
+		RetryMaxAttempts:        defaultInt(raw.Worker.RetryMaxAttempts, 5),
+		MaxConcurrentRunners:    defaultInt(raw.Worker.MaxConcurrentRunners, 100),
+		GitHubAPIBaseURL:        defaultString(raw.GitHub.APIBaseURL, "https://api.github.com"),
+		ConfigPath:              path,
+		RunnerSpecs:             raw.RunnerSpecs,
+		RunnerGroups:            raw.RunnerGroups,
+		RunnerPolicies:          raw.RunnerPolicies,
 	}
-	if err := cfg.loadSeedConfig(); err != nil {
+	if cfg.RunnerScope == "org" && cfg.GitHubOrg == "" {
+		cfg.GitHubOrg = cfg.GitHubOwner
+	}
+	if cfg.StateBackend == "sqlite" && strings.TrimSpace(cfg.StateDatabaseURL) == "" {
+		cfg.StateDatabaseURL = filepath.Join(".", "var", "runnerd.db")
+	}
+	if cfg.StateBackend == "sqlite" {
+		cfg.StateDir = filepath.Dir(cfg.StateDatabaseURL)
+	}
+	if err := cfg.validate(); err != nil {
 		return Config{}, err
-	}
-	var missing []string
-	for name, value := range map[string]string{
-		"ADMIN_TOKEN":           cfg.AdminToken,
-		"E2B_API_KEY":           cfg.E2BAPIKey,
-		"E2B_API_URL":           cfg.E2BAPIURL,
-		"E2B_DOMAIN":            cfg.E2BDomain,
-		"GITHUB_WEBHOOK_SECRET": cfg.GitHubWebhookSecret,
-		"SANDBOX_TEMPLATE_ID":   cfg.SandboxTemplateID,
-	} {
-		if value == "" {
-			missing = append(missing, name)
-		}
-	}
-	if cfg.GitHubToken == "" {
-		if cfg.GitHubAppID == 0 {
-			missing = append(missing, "GITHUB_TOKEN or GITHUB_APP_ID")
-		}
-		if cfg.GitHubAppInstallationID == 0 {
-			missing = append(missing, "GITHUB_APP_INSTALLATION_ID")
-		}
-		if cfg.GitHubAppPrivateKeyFile == "" {
-			missing = append(missing, "GITHUB_APP_PRIVATE_KEY_FILE")
-		}
-	}
-	switch cfg.RunnerScope {
-	case "repo":
-		if cfg.GitHubOwner == "" {
-			missing = append(missing, "GITHUB_OWNER")
-		}
-		if cfg.GitHubRepo == "" {
-			missing = append(missing, "GITHUB_REPO")
-		}
-	case "org":
-		if cfg.GitHubOrg == "" {
-			cfg.GitHubOrg = cfg.GitHubOwner
-		}
-		if cfg.GitHubOrg == "" {
-			missing = append(missing, "GITHUB_ORG")
-		}
-	default:
-		return Config{}, fmt.Errorf("RUNNER_SCOPE must be repo or org")
-	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("missing required env: %s", strings.Join(missing, ", "))
-	}
-	if cfg.MaxConcurrentRunners < 1 {
-		return Config{}, fmt.Errorf("MAX_CONCURRENT_RUNNERS must be >= 1")
-	}
-	if len(cfg.RunnerLabels) == 0 {
-		return Config{}, fmt.Errorf("RUNNER_LABELS must include at least one label")
 	}
 	cfg.ensureDefaultSeeds()
 	return cfg, nil
 }
 
 func (c Config) GitHubAuthMode() string {
-	if c.GitHubToken != "" {
-		return "token"
-	}
 	return "app"
 }
 
@@ -165,83 +212,112 @@ func (c Config) DefaultRepositoryPattern() string {
 	return ""
 }
 
-func (c *Config) loadSeedConfig() error {
-	if strings.TrimSpace(c.ConfigFile) == "" {
-		return nil
-	}
-	data, err := os.ReadFile(c.ConfigFile)
-	if err != nil {
-		return err
-	}
-	var file struct {
-		Profiles           []RunnerProfileConfig    `yaml:"profiles"`
-		RepositoryPolicies []RepositoryPolicyConfig `yaml:"repository_policies"`
-	}
-	if err := yaml.Unmarshal(data, &file); err != nil {
-		return err
-	}
-	c.Profiles = file.Profiles
-	c.RepositoryPolicies = file.RepositoryPolicies
-	return nil
-}
-
 func (c *Config) ensureDefaultSeeds() {
-	if len(c.Profiles) == 0 {
-		c.Profiles = []RunnerProfileConfig{{
-			Name:           "default",
-			Labels:         append([]string(nil), c.RunnerLabels...),
-			TemplateID:     c.SandboxTemplateID,
-			RunnerGroup:    "default",
-			MaxConcurrency: c.MaxConcurrentRunners,
-			Enabled:        true,
+	if len(c.RunnerSpecs) == 0 {
+		c.RunnerSpecs = []RunnerSpecConfig{{
+			Name:             "default",
+			Labels:           append([]string(nil), c.RunnerLabels...),
+			TemplateID:       c.SandboxTemplateID,
+			RunnerGroup:      "default",
+			MaxConcurrency:   c.MaxConcurrentRunners,
+			Enabled:          true,
+			DefaultAvailable: true,
 		}}
 	}
-	if len(c.RepositoryPolicies) == 0 {
+	if len(c.RunnerGroups) == 0 {
+		c.RunnerGroups = []RunnerGroupConfig{{
+			Name:      "default",
+			SpecNames: []string{"default"},
+			Enabled:   true,
+		}}
+	}
+	if len(c.RunnerPolicies) == 0 {
 		if repository := c.DefaultRepositoryPattern(); repository != "" {
-			c.RepositoryPolicies = []RepositoryPolicyConfig{{
-				Repository:      repository,
-				AllowedProfiles: []string{"default"},
+			c.RunnerPolicies = []RunnerPolicyConfig{{
+				Repository:    repository,
+				AllowedGroups: []string{"default"},
 			}}
 		}
 	}
 }
 
-func env(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
+func (c Config) validate() error {
+	var missing []string
+	for path, value := range map[string]string{
+		"admin.token":                 c.AdminToken,
+		"e2b.api_key":                 c.E2BAPIKey,
+		"e2b.api_url":                 c.E2BAPIURL,
+		"e2b.domain":                  c.E2BDomain,
+		"e2b.template_id":             c.SandboxTemplateID,
+		"github.webhook_secret":       c.GitHubWebhookSecret,
+		"github.app.private_key_file": c.GitHubAppPrivateKeyFile,
+	} {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, path)
+		}
 	}
-	return fallback
+	if c.GitHubAppID == 0 {
+		missing = append(missing, "github.app.id")
+	}
+	if c.GitHubAppInstallationID == 0 {
+		missing = append(missing, "github.app.installation_id")
+	}
+	switch c.RunnerScope {
+	case "repo":
+	case "org":
+		if c.GitHubOrg == "" {
+			missing = append(missing, "github.org")
+		}
+	default:
+		return fmt.Errorf("invalid config github.scope: must be repo or org")
+	}
+	if c.StateBackend != "sqlite" && c.StateBackend != "postgres" {
+		return fmt.Errorf("invalid config database.backend: must be sqlite or postgres")
+	}
+	if strings.TrimSpace(c.StateDatabaseURL) == "" {
+		missing = append(missing, "database.url")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing required config: %s", strings.Join(missing, ", "))
+	}
+	if c.MaxConcurrentRunners < 1 {
+		return fmt.Errorf("invalid config worker.max_concurrent_runners: must be >= 1")
+	}
+	if c.RetryMaxAttempts < 1 {
+		return fmt.Errorf("invalid config worker.retry_max_attempts: must be >= 1")
+	}
+	if len(c.RunnerLabels) == 0 {
+		return fmt.Errorf("invalid config worker.runner_labels: must include at least one label")
+	}
+	return nil
 }
 
-func envInt(name string, fallback int) int {
-	v := os.Getenv(name)
-	if v == "" {
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
 		return fallback
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return fallback
-	}
-	return n
+	return value
 }
 
-func envInt64(name string, fallback int64) int64 {
-	v := os.Getenv(name)
-	if v == "" {
+func defaultInt(value, fallback int) int {
+	if value <= 0 {
 		return fallback
 	}
-	n, err := strconv.ParseInt(v, 10, 64)
-	if err != nil {
-		return fallback
-	}
-	return n
+	return value
 }
 
-func splitLabels(value string) []string {
+func durationSeconds(value, fallback int) time.Duration {
+	if value <= 0 {
+		value = fallback
+	}
+	return time.Duration(value) * time.Second
+}
+
+func normalizeLabels(values []string) []string {
 	seen := map[string]bool{}
 	var labels []string
-	for _, part := range strings.Split(value, ",") {
-		label := strings.TrimSpace(part)
+	for _, value := range values {
+		label := strings.TrimSpace(value)
 		if label == "" || seen[label] {
 			continue
 		}

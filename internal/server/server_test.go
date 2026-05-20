@@ -22,17 +22,21 @@ import (
 )
 
 type fakeSandbox struct {
-	mu         sync.Mutex
-	started    int
-	stopped    int
-	startBlock chan struct{}
-	stopErr    error
+	mu             sync.Mutex
+	started        int
+	stopped        int
+	startBlock     chan struct{}
+	stopErr        error
+	commandContext context.Context
+	repositoryURL  string
 }
 
 func (f *fakeSandbox) StartRunner(ctx context.Context, input sandboxrunner.StartInput) (sandboxrunner.StartResult, error) {
 	f.mu.Lock()
 	f.started++
 	block := f.startBlock
+	f.commandContext = input.CommandContext
+	f.repositoryURL = input.RepositoryURL
 	f.mu.Unlock()
 	if block != nil {
 		select {
@@ -64,6 +68,18 @@ func (f *fakeSandbox) stoppedCount() int {
 	return f.stopped
 }
 
+func (f *fakeSandbox) lastCommandContext() context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.commandContext
+}
+
+func (f *fakeSandbox) lastRepositoryURL() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.repositoryURL
+}
+
 func TestManualCreateAndDeleteRunner(t *testing.T) {
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -74,10 +90,10 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
 	body := bytes.NewBufferString(`{"id":"manual-1"}`)
-	req := adminRequest(http.MethodPost, "/runners", body)
+	req := adminRequest(http.MethodPost, "/runner_requests", body)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -87,8 +103,17 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 	if fake.startedCount() != 1 {
 		t.Fatalf("expected one sandbox start, got %d", fake.startedCount())
 	}
+	commandCtx := fake.lastCommandContext()
+	if commandCtx == nil {
+		t.Fatal("expected sandbox start to receive a long-lived command context")
+	}
+	select {
+	case <-commandCtx.Done():
+		t.Fatalf("command context was canceled immediately after runner create: %v", commandCtx.Err())
+	default:
+	}
 
-	req = adminRequest(http.MethodDelete, "/runners/manual-1", nil)
+	req = adminRequest(http.MethodDelete, "/runner_requests/manual-1", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -98,7 +123,7 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 		t.Fatalf("expected one sandbox stop, got %d", fake.stoppedCount())
 	}
 
-	req = adminRequest(http.MethodDelete, "/runners/manual-1", nil)
+	req = adminRequest(http.MethodDelete, "/runner_requests/manual-1", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -109,18 +134,25 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 	}
 }
 
+func TestRunnerExitMessageIncludesSDKError(t *testing.T) {
+	got := runnerExitMessage(sandboxrunner.ExitResult{ExitCode: -1, Error: "stream closed before end event"})
+	if !strings.Contains(got, "stream closed before end event") {
+		t.Fatalf("expected SDK error in exit message, got %q", got)
+	}
+}
+
 func TestManagementEndpointsRequireAdminAuth(t *testing.T) {
 	store := state.New(t.TempDir())
-	srv := newTestServer(store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
 
-	req := httptest.NewRequest(http.MethodGet, "/runners", nil)
+	req := httptest.NewRequest(http.MethodGet, "/runner_requests", nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected missing auth to be rejected, got %d", rec.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/runners", nil)
+	req = httptest.NewRequest(http.MethodGet, "/runner_requests", nil)
 	req.Header.Set("Authorization", "Bearer wrong")
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -128,7 +160,7 @@ func TestManagementEndpointsRequireAdminAuth(t *testing.T) {
 		t.Fatalf("expected wrong auth to be rejected, got %d", rec.Code)
 	}
 
-	req = adminRequest(http.MethodGet, "/runners", nil)
+	req = adminRequest(http.MethodGet, "/runner_requests", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -138,7 +170,7 @@ func TestManagementEndpointsRequireAdminAuth(t *testing.T) {
 
 func TestAdminUIIsServedWithoutAPIAccess(t *testing.T) {
 	store := state.New(t.TempDir())
-	srv := newTestServer(store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/", nil)
 	rec := httptest.NewRecorder()
@@ -148,6 +180,16 @@ func TestAdminUIIsServedWithoutAPIAccess(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `<div id="root">`) || !strings.Contains(rec.Body.String(), `/admin/assets/`) {
 		t.Fatalf("admin ui did not contain expected vite shell")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/admin/runner_specs", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected admin route fallback, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `<div id="root">`) {
+		t.Fatalf("admin route fallback did not serve vite shell")
 	}
 }
 
@@ -162,16 +204,16 @@ func TestRunnerLogsRequireAdminAuth(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.AppendLog("with-log", "control.log", []byte("created\n"))
-	srv := newTestServer(store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
 
-	req := httptest.NewRequest(http.MethodGet, "/runners/with-log/logs/control.log", nil)
+	req := httptest.NewRequest(http.MethodGet, "/runner_requests/with-log/logs/control.log", nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected log endpoint to require auth, got %d", rec.Code)
 	}
 
-	req = adminRequest(http.MethodGet, "/runners/with-log/logs/control.log", nil)
+	req = adminRequest(http.MethodGet, "/runner_requests/with-log/logs/control.log", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -181,25 +223,31 @@ func TestRunnerLogsRequireAdminAuth(t *testing.T) {
 		t.Fatalf("unexpected log body: %q", rec.Body.String())
 	}
 
-	req = adminRequest(http.MethodGet, "/runners/with-log/logs/request.json", nil)
+	req = adminRequest(http.MethodGet, "/runner_requests/with-log/logs/request.json", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected unsupported log to be rejected, got %d", rec.Code)
 	}
+
+	req = adminRequest(http.MethodGet, "/runner_requests/with-log/logs/stderr.log", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected missing valid log to be returned as empty, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "" {
+		t.Fatalf("expected empty missing log response, got %q", rec.Body.String())
+	}
 }
 
 func TestWebhookQueuedIsIdempotent(t *testing.T) {
-	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
-	}))
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
 	defer ghServer.Close()
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
 	payload := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
 	for i := 0; i < 2; i++ {
@@ -218,17 +266,148 @@ func TestWebhookQueuedIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
+func TestWorkflowRunInProgressBackfillsQueuedJobs(t *testing.T) {
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runs/123/jobs":
+			w.Write([]byte(`{"jobs":[{"id":1001,"name":"test","status":"queued","labels":["self-hosted","e2b"]},{"id":1002,"name":"done","status":"completed","labels":["self-hosted","e2b"]}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/jobs/1001":
+			w.Write([]byte(`{"id":1001,"name":"test","status":"queued","labels":["self-hosted","e2b"]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ghServer.Close()
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
+
+	payload := []byte(`{"action":"in_progress","repository":{"full_name":"o/r"},"workflow_run":{"id":123,"name":"ci"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_run")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "1001", state.StatusRunning)
+	if fake.startedCount() != 1 {
+		t.Fatalf("expected one sandbox start, got %d", fake.startedCount())
+	}
+	if _, err := store.ReadState("1002"); err == nil {
+		t.Fatal("completed workflow_run job should not create a runner")
+	}
+}
+
+func TestWorkflowRunCompletedIsLoggedAndIgnored(t *testing.T) {
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+
+	payload := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_run":{"id":123,"name":"ci"}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_run")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["status"] != "ignored" {
+		t.Fatalf("expected ignored response, got %#v", response)
+	}
+}
+
+func TestWebhookQueuedSkipsSandboxWhenGitHubJobNoLongerQueued(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/jobs/1001":
+			w.Write([]byte(`{"id":1001,"name":"test","status":"completed","conclusion":"cancelled","labels":["self-hosted","e2b"]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			t.Fatalf("registration token should not be requested for a completed job")
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+
+	payload := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected queued status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "1001", state.StatusCompleted)
+	if fake.startedCount() != 0 {
+		t.Fatalf("expected no sandbox start, got %d", fake.startedCount())
+	}
+}
+
+func TestWebhookQueuedUsesEventRepositoryForRepoRunner(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/other/repo/actions/jobs/1001":
+			w.Write([]byte(`{"id":1001,"name":"test","status":"queued","labels":["self-hosted","e2b"]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/other/repo/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	if _, err := store.UpsertRepositoryPolicy(state.RepositoryPolicy{
+		RepositoryFullName: "other/repo",
+		ProfileName:        "default",
+		Enabled:            true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+
+	payload := []byte(`{"action":"queued","repository":{"full_name":"other/repo"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected queued status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "1001", state.StatusRunning)
+	if got := fake.lastRepositoryURL(); got != "https://github.com/other/repo" {
+		t.Fatalf("expected event repository URL, got %q", got)
+	}
+}
+
+func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
 	queued := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(queued))
@@ -267,16 +446,12 @@ func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
 }
 
 func TestWebhookCompletedIsIdempotent(t *testing.T) {
-	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
-	}))
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
 	defer ghServer.Close()
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
 	queued := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(queued))
@@ -316,17 +491,13 @@ func TestWebhookCompletedIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestWebhookCompletedWithoutManagedRunnerDoesNotStopByJobID(t *testing.T) {
-	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
-	}))
+func TestWebhookCompletedWithoutRunnerNameStopsByWorkflowJobID(t *testing.T) {
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
 	defer ghServer.Close()
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
 	queued := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(queued))
@@ -353,8 +524,27 @@ func TestWebhookCompletedWithoutManagedRunnerDoesNotStopByJobID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Status != state.StatusRunning {
-		t.Fatalf("expected running state, got %s", st.Status)
+	if st.Status != state.StatusCompleted {
+		t.Fatalf("expected completed state, got %s", st.Status)
+	}
+	if fake.stoppedCount() != 1 {
+		t.Fatalf("expected one sandbox stop, got %d", fake.stoppedCount())
+	}
+}
+
+func TestWebhookCompletedWithoutLocalRunnerIsIgnored(t *testing.T) {
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, "http://example.test", fake)
+
+	completed := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"name":"staticcheck","runner_name":"","labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(completed))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", completed))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected completed status: %d body=%s", rec.Code, rec.Body.String())
 	}
 	if fake.stoppedCount() != 0 {
 		t.Fatalf("expected no sandbox stop, got %d", fake.stoppedCount())
@@ -372,9 +562,9 @@ func TestStopDuringCreateCleansStartedSandbox(t *testing.T) {
 	store := state.New(t.TempDir())
 	block := make(chan struct{})
 	fake := &fakeSandbox{startBlock: block}
-	srv := newTestServer(store, ghServer.URL, fake)
+	srv := newTestServer(t, store, ghServer.URL, fake)
 
-	req := adminRequest(http.MethodPost, "/runners", bytes.NewBufferString(`{"id":"manual-creating"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-creating"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -382,7 +572,7 @@ func TestStopDuringCreateCleansStartedSandbox(t *testing.T) {
 	}
 	waitForSandboxStarts(t, fake, 1)
 
-	req = adminRequest(http.MethodDelete, "/runners/manual-creating", nil)
+	req = adminRequest(http.MethodDelete, "/runner_requests/manual-creating", nil)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -421,7 +611,7 @@ func TestRecoverStopsActiveRunnerState(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &fakeSandbox{}
-	srv := newTestServer(store, "http://example.test", fake)
+	srv := newTestServer(t, store, "http://example.test", fake)
 	if err := srv.Recover(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -429,8 +619,11 @@ func TestRecoverStopsActiveRunnerState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != state.StatusCompleted {
-		t.Fatalf("expected recovered state to be completed, got %s", got.Status)
+	if got.Status != state.StatusFailed {
+		t.Fatalf("expected recovered state to be failed, got %s", got.Status)
+	}
+	if got.FailureStage != "recovery" || got.FailureReason != "interrupted_runner" {
+		t.Fatalf("unexpected recovery failure metadata: %#v", got)
 	}
 	if fake.stoppedCount() != 1 {
 		t.Fatalf("expected recovery to stop sandbox once, got %d", fake.stoppedCount())
@@ -447,7 +640,7 @@ func TestConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
-	srv := newTestServerWithLimit(store, ghServer.URL, fake, 1)
+	srv := newTestServerWithLimit(t, store, ghServer.URL, fake, 1)
 	if _, _, err := store.CreateRequest(state.RunnerRequest{
 		ID:         "existing-active",
 		Source:     "test",
@@ -457,7 +650,7 @@ func TestConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := adminRequest(http.MethodPost, "/runners", bytes.NewBufferString(`{"id":"manual-2"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-2"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusTooManyRequests {
@@ -467,25 +660,25 @@ func TestConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 
 func TestProfileAndRepositoryPolicyEndpoints(t *testing.T) {
 	store := state.New(t.TempDir())
-	srv := newTestServer(store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
 
 	profileBody := bytes.NewBufferString(`{"name":"large","labels":["self-hosted","e2b","large"],"template_id":"large","runner_group":"large","max_concurrency":5,"min_idle":1,"priority":10,"enabled":true}`)
-	req := adminRequest(http.MethodPost, "/profiles", profileBody)
+	req := adminRequest(http.MethodPost, "/runner_specs", profileBody)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("unexpected create profile status: %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	policyBody := bytes.NewBufferString(`{"repository_full_name":"o/heavy","profile_name":"large","enabled":true}`)
-	req = adminRequest(http.MethodPost, "/repository-policies", policyBody)
+	policyBody := bytes.NewBufferString(`{"repository_full_name":"o/heavy","runner_spec_name":"large","enabled":true}`)
+	req = adminRequest(http.MethodPost, "/runner_policies", policyBody)
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("unexpected create policy status: %d body=%s", rec.Code, rec.Body.String())
 	}
 
-	req = adminRequest(http.MethodPost, "/profiles/match-test", bytes.NewBufferString(`{"repository_full_name":"o/heavy","labels":["self-hosted","e2b","large"]}`))
+	req = adminRequest(http.MethodPost, "/runner_specs/match", bytes.NewBufferString(`{"repository_full_name":"o/heavy","labels":["self-hosted","e2b","large"]}`))
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -493,6 +686,143 @@ func TestProfileAndRepositoryPolicyEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"name":"large"`) {
 		t.Fatalf("expected large profile in match response, got %s", rec.Body.String())
+	}
+}
+
+func TestRunnerGroupAndRepositoryPolicyEndpoints(t *testing.T) {
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+
+	profileBody := bytes.NewBufferString(`{"name":"large","labels":["self-hosted","e2b","large"],"template_id":"large","max_concurrency":5,"enabled":true}`)
+	req := adminRequest(http.MethodPost, "/runner_specs", profileBody)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create profile status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	groupBody := bytes.NewBufferString(`{"name":"ubuntu-2404","spec_names":["large"],"enabled":true}`)
+	req = adminRequest(http.MethodPost, "/runner_groups", groupBody)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create group status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	policyBody := bytes.NewBufferString(`{"repository_full_name":"o/heavy","runner_group_name":"ubuntu-2404","enabled":true}`)
+	req = adminRequest(http.MethodPost, "/runner_policies", policyBody)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create group policy status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = adminRequest(http.MethodPost, "/runner_specs/match", bytes.NewBufferString(`{"repository_full_name":"o/heavy","labels":["self-hosted","e2b","large"]}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected match status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"name":"large"`) {
+		t.Fatalf("expected large profile through group policy, got %s", rec.Body.String())
+	}
+}
+
+func TestManualExplicitProfileMustRespectRepositoryPolicy(t *testing.T) {
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+
+	profileBody := bytes.NewBufferString(`{"name":"large","labels":["self-hosted","e2b","large"],"template_id":"large","runner_group":"large","max_concurrency":5,"enabled":true}`)
+	req := adminRequest(http.MethodPost, "/runner_specs", profileBody)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create profile status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	req = adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-large","repository_full_name":"o/blocked","runner_spec_name":"large"}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected policy rejection, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRetryRunnerRequeuesFailedRequestAndWritesAuditEvent(t *testing.T) {
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "retry-me",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		RequestedLabels:    []string{"self-hosted", "e2b"},
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerGroup:        "default",
+		RunnerName:         "e2b-retry-me",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusFailed
+	st.FailureStage = "sandbox_start"
+	st.FailureReason = "backend_server_error"
+	st.LastErrorCode = "backend_server_error"
+	st.LastErrorMessage = "temporary failure"
+	st.LastErrorRetryable = true
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	req := adminRequest(http.MethodPost, "/runner_requests/retry-me/retry", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected retry status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	srv.Close()
+
+	got, err := store.ReadState("retry-me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusQueued || !got.NextRetryAt.IsZero() {
+		t.Fatalf("expected queued retry state, got %#v", got)
+	}
+	events, err := store.ListAuditEvents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) == 0 || events[0].Action != "runner.retry" {
+		t.Fatalf("expected retry audit event, got %#v", events)
+	}
+}
+
+func TestRetryRunnerRejectsRunningRequest(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	srv := newTestServerWithLimit(t, store, ghServer.URL, &fakeSandbox{}, 10)
+
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"running-retry"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected create status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "running-retry", state.StatusRunning)
+
+	req = adminRequest(http.MethodPost, "/runner_requests/running-retry/retry", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected retry conflict, got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -515,28 +845,169 @@ func TestSweeperMarksTimedOutCreatesFailed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	srv := newTestServerWithLimit(store, "http://example.test", &fakeSandbox{}, 10)
+	srv := newTestServerWithLimit(t, store, "http://example.test", &fakeSandbox{}, 10)
 	srv.cfg.SandboxCreateTimeout = time.Second
 	srv.sweepOnce()
+	srv.Close()
 
 	got, err := store.ReadState("timed-out-create")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != state.StatusFailed || got.FailureReason != "create_timeout" {
+	if got.Status != state.StatusQueued || got.RetryCount != 1 || got.NextRetryAt.IsZero() || got.LastErrorRetryable != true {
 		t.Fatalf("unexpected swept state: %#v", got)
 	}
 }
 
-func newTestServer(store state.Store, ghURL string, fake *fakeSandbox) *Server {
-	return newTestServerWithLimit(store, ghURL, fake, 10)
+func TestSweeperRespectsStoppingRetryBackoff(t *testing.T) {
+	store := state.New(t.TempDir())
+	if _, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "stop-backoff",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerGroup:        "default",
+		RunnerName:         "e2b-stop-backoff",
+	}, nil); err != nil {
+		t.Fatal(err)
+	} else {
+		st.Status = state.StatusStopping
+		st.SandboxID = "sb-stop-backoff"
+		st.ProcessPID = 42
+		st.StoppingAt = time.Now().Add(-10 * time.Second).UTC()
+		st.NextRetryAt = time.Now().Add(time.Minute).UTC()
+		if err := store.WriteState(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeSandbox{}
+	srv := newTestServerWithLimit(t, store, "http://example.test", fake, 10)
+	srv.cfg.SandboxStopTimeout = time.Second
+	srv.sweepOnce()
+	if fake.stoppedCount() != 0 {
+		t.Fatalf("expected sweeper to respect next_retry_at, got %d stops", fake.stoppedCount())
+	}
 }
 
-func newTestServerWithLimit(store state.Store, ghURL string, fake *fakeSandbox, limit int) *Server {
+func TestSweeperStopsIdleRunnerThatNeverAcceptedJob(t *testing.T) {
+	store := state.New(t.TempDir())
+	if _, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "idle-runner",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerGroup:        "default",
+		RunnerName:         "e2b-idle-runner",
+	}, nil); err != nil {
+		t.Fatal(err)
+	} else {
+		st.Status = state.StatusRunning
+		st.SandboxID = "sb-idle-runner"
+		st.ProcessPID = 42
+		st.RunningAt = time.Now().Add(-10 * time.Minute).UTC()
+		if err := store.WriteState(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeSandbox{}
+	srv := newTestServerWithLimit(t, store, "http://example.test", fake, 10)
+	srv.cfg.RunnerIdleTimeout = time.Minute
+	srv.sweepOnce()
+	if fake.stoppedCount() != 1 {
+		t.Fatalf("expected sweeper to stop idle runner, got %d stops", fake.stoppedCount())
+	}
+	got, err := store.ReadState("idle-runner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusCompleted {
+		t.Fatalf("expected completed idle runner, got %s", got.Status)
+	}
+}
+
+func TestSweeperKeepsRunnerAfterJobStarted(t *testing.T) {
+	store := state.New(t.TempDir())
+	if _, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "busy-runner",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerGroup:        "default",
+		RunnerName:         "e2b-busy-runner",
+	}, nil); err != nil {
+		t.Fatal(err)
+	} else {
+		st.Status = state.StatusRunning
+		st.SandboxID = "sb-busy-runner"
+		st.ProcessPID = 42
+		st.RunningAt = time.Now().Add(-10 * time.Minute).UTC()
+		st.AssignedJobName = runnerJobStartedMarker
+		if err := store.WriteState(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fake := &fakeSandbox{}
+	srv := newTestServerWithLimit(t, store, "http://example.test", fake, 10)
+	srv.cfg.RunnerIdleTimeout = time.Minute
+	srv.sweepOnce()
+	if fake.stoppedCount() != 0 {
+		t.Fatalf("expected sweeper to keep runner with started job, got %d stops", fake.stoppedCount())
+	}
+}
+
+func TestProfileConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServerWithLimit(t, store, ghServer.URL, fake, 10)
+	if _, err := store.UpsertProfile(state.RunnerProfile{
+		Name:           "default",
+		Labels:         []string{"self-hosted", "e2b"},
+		TemplateID:     "base",
+		RunnerGroup:    "default",
+		MaxConcurrency: 1,
+		Enabled:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-1"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected first create status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "profile-1", state.StatusRunning)
+
+	req = adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-2"}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected profile concurrency rejection, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func newTestServer(t *testing.T, store state.Store, ghURL string, fake *fakeSandbox) *Server {
+	t.Helper()
+	return newTestServerWithLimit(t, store, ghURL, fake, 10)
+}
+
+func newTestServerWithLimit(t *testing.T, store state.Store, ghURL string, fake *fakeSandbox, limit int) *Server {
+	t.Helper()
 	cfg := config.Config{
-		StateDir:             "./var/runners",
+		StateDir:             "./var/runner_requests",
+		StateBackend:         "sqlite",
+		StateDatabaseURL:     "./var/runnerd.db",
 		AdminToken:           "admin-token",
-		GitHubToken:          "gh-token",
 		GitHubWebhookSecret:  "secret",
 		GitHubOwner:          "o",
 		GitHubRepo:           "r",
@@ -545,6 +1016,11 @@ func newTestServerWithLimit(store state.Store, ghURL string, fake *fakeSandbox, 
 		SandboxTimeout:       time.Hour,
 		SandboxCreateTimeout: time.Second,
 		SandboxStopTimeout:   time.Second,
+		RunnerIdleTimeout:    5 * time.Minute,
+		WorkerLeaseTTL:       5 * time.Second,
+		RetryBaseDelay:       50 * time.Millisecond,
+		RetryMaxDelay:        time.Second,
+		RetryMaxAttempts:     3,
 		MaxConcurrentRunners: limit,
 		GitHubAPIBaseURL:     ghURL,
 	}
@@ -565,8 +1041,10 @@ func newTestServerWithLimit(store state.Store, ghURL string, fake *fakeSandbox, 
 	}); err != nil {
 		panic(err)
 	}
-	gh := github.NewClient(ghURL, "gh-token", "repo", "o", "", "r", http.DefaultClient)
-	return New(cfg, store, gh, fake, nil)
+	gh := github.NewClient(ghURL, "repo", "o", "", "r", http.DefaultClient)
+	srv := New(cfg, store, gh, fake, nil)
+	t.Cleanup(srv.Close)
+	return srv
 }
 
 func adminRequest(method, target string, body io.Reader) *http.Request {
@@ -618,4 +1096,21 @@ func sign(secret string, body []byte) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+}
+
+func githubRunnerAPI(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/jobs/"):
+			id := strings.TrimPrefix(r.URL.Path, "/repos/o/r/actions/jobs/")
+			w.Write([]byte(`{"id":` + id + `,"name":"test","status":"queued","labels":["self-hosted","e2b"]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}
 }

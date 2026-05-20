@@ -174,3 +174,179 @@ func TestMatchProfileReturnsReasonWhenPolicyMissing(t *testing.T) {
 		t.Fatalf("unexpected match result: %#v", match)
 	}
 }
+
+func TestDefaultAvailableProfileMatchesWithoutRepositoryPolicy(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.UpsertProfile(RunnerProfile{
+		Name:             "default",
+		Labels:           []string{"self-hosted", "e2b"},
+		TemplateID:       "base",
+		MaxConcurrency:   10,
+		Enabled:          true,
+		DefaultAvailable: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	match, err := store.MatchProfile("owner/any-repo", []string{"self-hosted", "e2b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if match.Profile == nil || match.Profile.Name != "default" {
+		t.Fatalf("expected default profile match, got %#v", match.Profile)
+	}
+}
+
+func TestRunnerGroupPolicyMatchesGroupSpecs(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.UpsertProfile(RunnerProfile{
+		Name:           "small",
+		Labels:         []string{"self-hosted", "e2b", "small"},
+		TemplateID:     "small-template",
+		MaxConcurrency: 10,
+		Enabled:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertProfile(RunnerProfile{
+		Name:           "large",
+		Labels:         []string{"self-hosted", "e2b", "large"},
+		TemplateID:     "large-template",
+		MaxConcurrency: 5,
+		Priority:       20,
+		Enabled:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertRunnerGroup(RunnerGroup{
+		Name:      "ubuntu-2404",
+		SpecNames: []string{"small", "large"},
+		Enabled:   true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertRepositoryPolicy(RepositoryPolicy{
+		RepositoryFullName: "owner/repo",
+		RunnerGroupName:    "ubuntu-2404",
+		Enabled:            true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	match, err := store.MatchProfile("owner/repo", []string{"self-hosted", "e2b", "large"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if match.Profile == nil || match.Profile.Name != "large" {
+		t.Fatalf("expected large profile through group policy, got %#v", match.Profile)
+	}
+}
+
+func TestClaimNextRunnableHonorsLeaseAndRetryWindow(t *testing.T) {
+	store := New(t.TempDir())
+	now := time.Now().UTC()
+	if _, st, err := store.CreateRequest(RunnerRequest{
+		ID:              "retryable",
+		Source:          "test",
+		RequestedLabels: []string{"self-hosted"},
+		Labels:          []string{"self-hosted"},
+		RunnerName:      "e2b-retryable",
+	}, nil); err != nil {
+		t.Fatal(err)
+	} else {
+		st.NextRetryAt = now.Add(-time.Second)
+		if err := store.WriteState(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	req, st, claimed, err := store.ClaimNextRunnable("worker-1", now, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed || req.ID != "retryable" || st.LeaseOwner != "worker-1" || st.LastAttemptAt.IsZero() {
+		t.Fatalf("unexpected claim result: req=%#v state=%#v claimed=%v", req, st, claimed)
+	}
+
+	_, _, claimed, err = store.ClaimNextRunnable("worker-2", now, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("expected active lease to block second claim")
+	}
+}
+
+func TestRetryRequestClearsFailureFields(t *testing.T) {
+	store := New(t.TempDir())
+	_, st, err := store.CreateRequest(RunnerRequest{
+		ID:              "retry-me",
+		Source:          "test",
+		RequestedLabels: []string{"self-hosted"},
+		Labels:          []string{"self-hosted"},
+		RunnerName:      "e2b-retry-me",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = StatusFailed
+	st.FailureStage = "sandbox_start"
+	st.FailureReason = "backend_server_error"
+	st.LastErrorCode = "backend_server_error"
+	st.LastErrorMessage = "temporary failure"
+	st.LastErrorRetryable = true
+	st.NextRetryAt = time.Now().Add(time.Minute).UTC()
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	retried, err := store.RetryRequest("retry-me", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != StatusQueued || retried.FailureStage != "" || retried.LastErrorCode != "" || !retried.NextRetryAt.IsZero() {
+		t.Fatalf("unexpected retried state: %#v", retried)
+	}
+}
+
+func TestRetryRequestRejectsActiveState(t *testing.T) {
+	store := New(t.TempDir())
+	_, st, err := store.CreateRequest(RunnerRequest{
+		ID:              "running",
+		Source:          "test",
+		RequestedLabels: []string{"self-hosted"},
+		Labels:          []string{"self-hosted"},
+		RunnerName:      "e2b-running",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = StatusRunning
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.RetryRequest("running", time.Now().UTC()); !errors.Is(err, ErrRetryNotAllowed) {
+		t.Fatalf("expected retry guard, got %v", err)
+	}
+}
+
+func TestAuditEventsCanBeListed(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.AppendAuditEvent(AuditEvent{
+		Actor:        "admin_api",
+		Action:       "runner.retry",
+		ResourceType: "runner_request",
+		ResourceID:   "retry-me",
+		PayloadJSON:  `{"status":"queued"}`,
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.ListAuditEvents(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Action != "runner.retry" {
+		t.Fatalf("unexpected audit events: %#v", events)
+	}
+}

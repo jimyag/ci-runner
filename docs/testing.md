@@ -2,100 +2,117 @@
 
 这份文档说明如何用本地 E2B sandbox 环境测试服务，以及如何在 GitHub 仓库中配置 self-hosted runner 自动拉起。
 
-## 1. 本地环境变量
+## 1. 本地配置文件
 
-服务必需变量：
-
-```bash
-export E2B_API_KEY="<e2b api key>"
-export E2B_API_URL="<e2b api url>"
-export E2B_DOMAIN="<e2b domain>"
-export ADMIN_TOKEN="<random admin token>"
-export GITHUB_WEBHOOK_SECRET="<random webhook secret>"
-export RUNNER_SCOPE="repo"
-export GITHUB_OWNER="<repo owner>"
-export GITHUB_REPO="<repo name>"
-export SANDBOX_TEMPLATE_ID="<template id>"
-```
-
-PAT 模式：
+服务现在默认读取 `./runnerd.yaml`；也可以通过 `--config` 指向别的路径：
 
 ```bash
-export GITHUB_TOKEN="<github token>"
+cp runnerd.yaml.example runnerd.yaml
+mkdir -p ./secrets
 ```
 
-GitHub App 模式：
-
-```bash
-export GITHUB_APP_ID="<github app id>"
-export GITHUB_APP_INSTALLATION_ID="<installation id>"
-export GITHUB_APP_PRIVATE_KEY_FILE="./secrets/github-app.pem"
-```
-
-组织级 runner 配置：
-
-```bash
-export RUNNER_SCOPE="org"
-export GITHUB_ORG="<org name>"
-```
-
-`RUNNER_SCOPE=repo` 时，runner 注册到 `https://github.com/<GITHUB_OWNER>/<GITHUB_REPO>`。`RUNNER_SCOPE=org` 时，runner 注册到 `https://github.com/<GITHUB_ORG>`，组织内仓库需要被对应 runner group 允许使用。
-
-可选变量：
-
-```bash
-export HTTP_ADDR=":25500"
-export STATE_DIR="./var/runners"
-export RUNNER_LABELS="self-hosted,e2b"
-export SANDBOX_TIMEOUT_SECONDS="3600"
-export SANDBOX_API_TIMEOUT_SECONDS="60"
-export SANDBOX_CREATE_TIMEOUT_SECONDS="120"
-export SANDBOX_STOP_TIMEOUT_SECONDS="30"
-export RECOVERY_TIMEOUT_SECONDS="120"
-export HTTP_READ_TIMEOUT_SECONDS="15"
-export HTTP_WRITE_TIMEOUT_SECONDS="60"
-export HTTP_IDLE_TIMEOUT_SECONDS="120"
-export MAX_CONCURRENT_RUNNERS="100"
-export RUNNERD_CONFIG_FILE="./runnerd.yaml"
-```
-
-可选的 `runnerd.yaml` 可以 seed profiles 和 repository policies，例如：
+最小可用配置示例：
 
 ```yaml
-profiles:
+server:
+  http_addr: ":25500"
+
+database:
+  backend: sqlite
+  url: ./var/runnerd.db
+
+admin:
+  token: <random admin token>
+
+e2b:
+  api_key: <e2b api key>
+  api_url: <e2b api url>
+  domain: <e2b domain>
+  template_id: <template id>
+
+github:
+  webhook_secret: <random webhook secret>
+  scope: repo
+  app:
+    id: <github app id>
+    installation_id: <installation id>
+    private_key_file: ./secrets/github-app.pem
+
+worker:
+  runner_labels: [self-hosted, e2b]
+  max_concurrent_runners: 100
+  recovery_timeout_seconds: 120
+  lease_ttl_seconds: 300
+  retry_base_delay_seconds: 15
+  retry_max_delay_seconds: 300
+  retry_max_attempts: 5
+
+runner_specs:
   - name: default
     labels: [self-hosted, e2b]
     template_id: <template id>
-    runner_group: default
     max_concurrency: 100
     enabled: true
+    default_available: true
 
-repository_policies:
-  - repository: <owner>/<repo>
-    allowed_profiles: [default]
+runner_groups:
+  - name: default
+    spec_names: [default]
+    enabled: true
+
+runner_policies:
+  - repository: <repo owner>/<repo name>
+    allowed_groups: [default]
 ```
 
-## 2. GitHub Token 权限
+组织级 runner 只要把 `github.scope` 改成 `org`，并填写 `github.org`。
 
-PAT 模式下，`GITHUB_TOKEN` 需要能调用对应 scope 的 runner registration token API。
+## 2. 创建 GitHub App 的完整流程
 
-Repository runner 推荐使用 fine-grained personal access token：
+不再使用 PAT；runnerd 只支持 GitHub App 鉴权。
 
-- Repository access：只选择目标仓库。
-- Permissions：`Administration` 设为 `Read and write`。
+GitHub App 需要能调用对应 scope 的 runner registration token API。Repository runner 需要目标仓库的 administration 权限；organization runner 需要组织级 self-hosted runner 管理权限。
 
-Organization runner 需要组织级 self-hosted runner 管理权限。注册端点是：
+建议流程：
 
-```text
-POST /orgs/{org}/actions/runners/registration-token
+1. 进入 GitHub `Settings -> Developer settings -> GitHub Apps -> New GitHub App`。
+2. 基础信息：
+   - GitHub App name：例如 `runnerd-local`
+   - Homepage URL：先填仓库地址或本地项目文档地址
+   - Webhook：如果 runnerd 自己收 webhook，可以先不开 App webhook，这里和 `workflow_job` webhook 不是一回事
+3. Repository permissions：
+   - `Administration` 设为 `Read and write`
+4. Organization permissions（如果要跑 org runner）：
+   - 打开对应 self-hosted runner 管理权限
+5. Where can this GitHub App be installed：
+   - 本地验证一般选 `Only on this account`
+6. 创建后，在 App 页面生成 private key，下载 `.pem` 文件，保存到本地例如 `./secrets/github-app.pem`
+7. 安装 App 到目标仓库或组织：
+   - 点 `Install App`
+   - 选择目标 owner
+   - 选择要授权的仓库
+8. 记录三个值：
+   - App ID
+   - Installation ID
+   - private key 文件路径
+
+对应填入 `runnerd.yaml`：
+
+```yaml
+github:
+  scope: repo
+  app:
+    id: <app id>
+    installation_id: <installation id>
+    private_key_file: ./secrets/github-app.pem
 ```
 
-也可以用 classic PAT，但权限面会更大，不推荐作为长期方案。GitHub App 模式下，runnerd 会自动用 installation token 调对应 registration token API。
+repo scope 下不需要固定 `owner/repo`；webhook 会使用 payload 里的 `repository.full_name` 创建对应 repository runner。`runner_specs.default_available: true` 的规格对所有仓库默认可用；`runner_policies` 只需要用于给某个仓库或仓库通配符追加特殊 spec，例如 `jimyag/*` 或 `jimyag/template-repository`。如果是 organization runner，把 `scope` 改成 `org`，并填写 `org`。
 
 ## 3. 启动服务
 
 ```bash
-go run ./cmd/runnerd
+go run ./cmd/runnerd --config ./runnerd.yaml
 ```
 
 健康检查：
@@ -110,50 +127,64 @@ curl -fsS http://127.0.0.1:25500/healthz
 http://127.0.0.1:25500/admin/
 ```
 
-页面会要求输入 `ADMIN_TOKEN`，之后在浏览器 local storage 中保存 token，并对 `/runners` 管理接口自动携带 `Authorization: Bearer $ADMIN_TOKEN`。
+页面会要求输入 `runnerd.yaml` 里的 `admin.token`，之后在浏览器 local storage 中保存 token，并对 `/runner_requests` 管理接口自动携带 `Authorization: Bearer <admin.token>`。
 
-后台页面源码在 `ui/`，使用和 `kubevirt-console` 相同的 React、Vite、Tailwind CSS、shadcn 风格组件和主题 CSS。`task build` 会先执行 `task ui-build`，把前端产物写入 `internal/server/admin/` 后再编译 `runnerd`。管理面现在包含 runners、profiles、repository policies、label match test 和 diagnostics 页面。
+后台页面源码在 `ui/`，使用和 `kubevirt-console` 相同的 React、Vite、Tailwind CSS、shadcn 风格组件和主题 CSS。`task build` 会先执行 `task ui-build`，把前端产物写入 `internal/server/admin/` 后再编译 `runnerd`。管理面现在包含 runners、runner specs、runner policies、retry、audit、label match test 和 diagnostics 页面。
 
 手动创建一个 runner：
 
 ```bash
-curl -fsS -X POST http://127.0.0.1:25500/runners \
+curl -fsS -X POST http://127.0.0.1:25500/runner_requests \
   -H "authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'content-type: application/json' \
-  -d '{"id":"manual-001","repository_full_name":"<owner>/<repo>","profile_name":"default"}' | jq
+  -d '{"id":"manual-001","repository_full_name":"<owner>/<repo>","runner_spec_name":"default"}' | jq
 ```
 
 查看状态：
 
 ```bash
-curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runners | jq
-curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runners/manual-001 | jq
+curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runner_requests | jq
+curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runner_requests/manual-001 | jq
 ```
 
 停止 runner：
 
 ```bash
-curl -fsS -X DELETE -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runners/manual-001 | jq
+curl -fsS -X DELETE -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runner_requests/manual-001 | jq
 ```
 
 状态库默认会写到：
 
 ```text
-var/runners/runnerd.db
+var/runnerd.db
 ```
 
 runner 的 control/stdout/stderr 日志存放在 DB-backed event store 里，仍然通过管理 API 读取：
 
 ```bash
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/manual-001/logs/control.log
+  http://127.0.0.1:25500/runner_requests/manual-001/logs/control.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/manual-001/logs/stdout.log
+  http://127.0.0.1:25500/runner_requests/manual-001/logs/stdout.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/manual-001/logs/stderr.log
+  http://127.0.0.1:25500/runner_requests/manual-001/logs/stderr.log
 ```
 
-## 4. 暴露 Webhook 地址
+## 4. 启动后第一次自检
+
+建议先确认 runnerd 已经正确读到 GitHub App 配置：
+
+```bash
+curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/diagnostics/pprof | jq
+```
+
+重点看：
+
+- `github.auth_mode` 是否是 `app`
+- `github.installation_id` 是否符合预期
+- `state.database` 是否指向你的 `runnerd.yaml` 里配置的数据库
+
+## 5. 暴露 Webhook 地址
 
 GitHub webhook 必须能访问到本地服务。任选一种方式：
 
@@ -177,9 +208,9 @@ https://<public-host>/webhooks/github
 
 这里的 `runner.example.com` 换成你自己的域名；不要把临时 quick tunnel 的随机 `trycloudflare.com` 地址写死到 GitHub 配置里。
 
-公网部署时只需要把 `/webhooks/github` 暴露给 GitHub。`/runners` 管理接口也可以在同一个服务上访问，但必须带 `Authorization: Bearer $ADMIN_TOKEN`；生产环境建议放在 HTTPS 反向代理后面，并限制管理接口来源 IP。
+公网部署时只需要把 `/webhooks/github` 暴露给 GitHub。`/runner_requests` 管理接口也可以在同一个服务上访问，但必须带 `Authorization: Bearer $ADMIN_TOKEN`；生产环境建议放在 HTTPS 反向代理后面，并限制管理接口来源 IP。
 
-## 5. 配置 GitHub Repository Webhook
+## 6. 配置 GitHub Repository Webhook
 
 在目标仓库中进入：
 
@@ -197,7 +228,7 @@ Settings -> Webhooks -> Add webhook
 
 保存后，GitHub 会发送一次 ping。当前服务只处理 `workflow_job` 事件，非 `workflow_job` 会返回 ignored，这是正常的。
 
-## 6. 配置 GitHub Actions Workflow
+## 7. 配置 GitHub Actions Workflow
 
 在目标仓库添加：
 
@@ -226,36 +257,36 @@ jobs:
 4. GitHub job 被 `self-hosted,e2b` runner 接走执行。
 5. runner 进程退出后，服务清理对应 sandbox。
 
-## 7. 排查顺序
+## 8. 排查顺序
 
 先看服务状态：
 
 ```bash
-curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runners | jq
+curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/runner_requests | jq
 ```
 
 再看 request 状态和日志：
 
 ```bash
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id> | jq
+  http://127.0.0.1:25500/runner_requests/<request_id> | jq
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/control.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/control.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/stdout.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/stdout.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/stderr.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/stderr.log
 ```
 
 常见问题：
 
 - `invalid signature`：GitHub webhook secret 和 `GITHUB_WEBHOOK_SECRET` 不一致。
-- `runner concurrency limit reached`：活跃 request 数量达到 `MAX_CONCURRENT_RUNNERS`。
+- `runner concurrency limit reached`：活跃 request 数量达到 `worker.max_concurrent_runners`。
 - GitHub job 一直 queued：workflow 的 `runs-on` labels 必须包含 `self-hosted` 和 `e2b`。
 - sandbox 创建失败：确认 `E2B_API_KEY`、`E2B_API_URL`、`E2B_DOMAIN` 是否匹配本地环境。
-- registration token 失败：确认 `GITHUB_TOKEN` 对目标仓库有 `Administration: Read and write` 权限。
+- registration token 失败：确认 GitHub App installation 对目标仓库有对应的 administration/self-hosted runner 权限。
 
-## 8. GitHub Actions 日志怎么看
+## 9. GitHub Actions 日志怎么看
 
 这是 repository 级 self-hosted GitHub Actions runner。job 被 sandbox 里的 runner 接走后，workflow step 的日志会正常显示在 GitHub Actions 页面里：
 
@@ -279,18 +310,18 @@ Repository -> Actions -> 选择 workflow run -> 选择 job
 
 ```bash
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id> | jq
+  http://127.0.0.1:25500/runner_requests/<request_id> | jq
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/control.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/control.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/stdout.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/stdout.log
 curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" \
-  http://127.0.0.1:25500/runners/<request_id>/logs/stderr.log
+  http://127.0.0.1:25500/runner_requests/<request_id>/logs/stderr.log
 ```
 
 服务自身日志会输出到启动 `go run ./cmd/runnerd` 的终端。
 
-## 9. Diagnostics / pprof
+## 10. Diagnostics / pprof
 
 服务导入了 `github.com/jimmicro/pprof`，启动后会在 binary 所在目录生成 `.pprof` 地址文件和 dump 脚本。管理 API 可以直接查看 diagnostics：
 
@@ -304,13 +335,13 @@ curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/diagn
 - 发现到的 pprof 地址文件
 - dump 脚本路径
 - 当前 DB 路径
-- GitHub 鉴权模式（token/app）
+- GitHub 鉴权模式（app）
 - sandbox API 配置摘要
 - 最近失败的 runner request
 
 `/diagnostics/vars` 会代理本地 pprof 服务的 `GET /debug/vars`，可以直接看到 expvar 指标摘要。
 
-## 9. 官方参考
+## 11. 官方参考
 
 - GitHub self-hosted runner workflow labels: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/using-self-hosted-runners-in-a-workflow
 - GitHub self-hosted runner autoscaling: https://docs.github.com/en/actions/hosting-your-own-runners/autoscaling-with-self-hosted-runners

@@ -10,7 +10,7 @@
 
 1. **状态存储支持 SQLite 和 Postgres。** SQLite 适合单机、本地和轻量部署；Postgres 适合公网、多实例、长期保留和复杂查询。不要再把本地文件作为主状态源。
 2. **状态机固定为 `queued -> creating -> running -> stopping -> completed/failed`。** `completed` 表示 runner/job 正常结束并完成清理；`failed` 表示任意阶段不可恢复失败或超过重试上限。
-3. **引入 runner profile / pool。** 每个 profile 定义 labels、sandbox template、并发上限、是否预热、runner group、允许使用的 repo。
+3. **引入 runner spec / pool。** 每个 profile 定义 labels、sandbox template、并发上限、是否预热、runner group、允许使用的 repo。
 4. **引入 repo policy。** 参考 ARC 对 runner group visibility 的处理：不是所有仓库都能使用所有 runner，必须有显式或可计算的可见性规则。
 5. **引入 reconciler/sweeper。** 不只依赖 webhook 和进程内 goroutine，而是周期性从 DB 扫描异常状态并收敛。
 6. **引入 metrics / diagnostics。** 运行时诊断使用 `github.com/jimmicro/pprof`；业务指标通过 `expvar` 注册，并由该包提供的 `/debug/vars` 暴露。指标内容参考 Fireactions 的 pool 指标和 ARC 的 workflow job 指标。
@@ -31,7 +31,7 @@
 
 1. 本地文件不适合多实例，也不方便复杂查询和策略判断。
 2. 进程重启后只能保守清理 active 状态，不能精确恢复调度。
-3. 没有 profile/pool，无法表达“某些仓库只能使用某些 runner”。
+3. 没有 spec/pool，无法表达“某些仓库只能使用某些 runner”。
 4. 没有统一的状态事件表，排查状态迁移只能看当前 state 和日志。
 5. metrics / diagnostics 还不完整，难以判断队列慢、sandbox 慢、GitHub token 慢还是 job 本身慢。
 
@@ -66,10 +66,10 @@ Fireactions 的 `Pool` 里有几个值得借鉴的点：
 4. `Pause()` / `Resume()` 可以暂停一个 pool 的扩缩容。
 5. `TriggerScale()` 用非阻塞 channel 合并多次 scale 请求。
 
-映射到当前项目，可以先做成 `runner_profiles`：
+映射到当前项目，可以先做成 `runner_specs`：
 
 ```yaml
-profiles:
+runner_specs:
   - name: default
     labels: [self-hosted, e2b]
     template_id: base-template
@@ -102,7 +102,7 @@ profiles:
 
 Fireactions 使用 GitHub App，并缓存 installation client。它还使用 JIT config，把 runner 配置下发给 VM。
 
-目标架构建议 **只支持 GitHub App，不支持 PAT**。原因是这个项目下一阶段要做组织级 repo policy、runner profile、runner group 和公网部署，GitHub App 的权限模型更贴近这些需求；支持 PAT 会让鉴权、权限审计、token 轮换和测试矩阵都多一条分支。
+目标架构建议 **只支持 GitHub App，不支持 PAT**。原因是这个项目下一阶段要做组织级 repo policy、runner spec、runner group 和公网部署，GitHub App 的权限模型更贴近这些需求；支持 PAT 会让鉴权、权限审计、token 轮换和测试矩阵都多一条分支。
 
 GitHub App 的收益：
 
@@ -130,7 +130,7 @@ Fireactions 的指标重点是 pool 级别：
 
 这些可以映射到 E2B，并通过 `expvar` 注册。运行时暴露统一使用 `github.com/jimmicro/pprof`，它会在本地随机端口启动 pprof HTTP 服务，提供 `/debug/vars`、`/debug/pprof/*`、堆内存管理接口，并在 binary 所在目录写入 `.pprof` 地址文件和一键 dump 脚本。
 
-- `e2b_runner_profiles_total`
+- `e2b_runner_specs_total`
 - `e2b_runner_profile_current{profile,owner,repo}`
 - `e2b_runner_profile_desired{profile}`
 - `e2b_runner_profile_pending{profile,direction}`
@@ -149,20 +149,20 @@ ARC 的 simulator 里有 `VisibleRunnerGroups`，核心思路是：GitHub Action
 
 当前项目需要类似概念。否则组织级 runner 一旦做大，会出现这些问题：
 
-1. 仓库 A 可以误用仓库 B 的 runner profile。
+1. 仓库 A 可以误用仓库 B 的 runner spec。
 2. 大规格 runner 被普通仓库无意占用。
 3. 管理员无法表达“这个 repo 只能用 default，那个 repo 可以用 large”。
 
 建议模型：
 
 ```yaml
-repository_policies:
+runner_policies:
   - repository: owner/repo-a
-    allowed_profiles: [default]
+    allowed_specs: [default]
   - repository: owner/repo-b
-    allowed_profiles: [default, large]
+    allowed_specs: [default, large]
   - repository: owner/security-sensitive
-    allowed_profiles: [secure]
+    allowed_specs: [secure]
 ```
 
 匹配顺序：
@@ -301,7 +301,7 @@ CREATE TABLE runner_requests (
   workflow_name TEXT,
   head_branch TEXT,
   labels_json TEXT NOT NULL,
-  profile_name TEXT,
+  runner_spec_name TEXT,
   runner_group TEXT,
   runner_name TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -341,7 +341,7 @@ CREATE TABLE runner_events (
 ```
 
 ```sql
-CREATE TABLE runner_profiles (
+CREATE TABLE runner_specs (
   name TEXT PRIMARY KEY,
   labels_json TEXT NOT NULL,
   template_id TEXT NOT NULL,
@@ -359,7 +359,7 @@ CREATE TABLE runner_profiles (
 CREATE TABLE repository_policies (
   id INTEGER PRIMARY KEY,
   repository_full_name TEXT NOT NULL,
-  profile_name TEXT NOT NULL,
+  runner_spec_name TEXT NOT NULL,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMP NOT NULL
 );
@@ -394,13 +394,13 @@ CREATE INDEX idx_runner_requests_repository_status
   ON runner_requests(repository_full_name, status);
 
 CREATE INDEX idx_runner_requests_profile_status
-  ON runner_requests(profile_name, status);
+  ON runner_requests(runner_spec_name, status);
 
 CREATE INDEX idx_runner_events_request_created
   ON runner_events(request_id, created_at);
 
 CREATE UNIQUE INDEX idx_repository_policies_repository_profile
-  ON repository_policies(repository_full_name, profile_name);
+  ON repository_policies(repository_full_name, runner_spec_name);
 
 CREATE INDEX idx_audit_events_resource_created
   ON audit_events(resource_type, resource_id, created_at);
@@ -502,24 +502,24 @@ stop 路径必须幂等：
 
 ### 9.1 新增 API
 
-- `GET /profiles`
-- `POST /profiles`
-- `GET /profiles/{name}`
-- `PATCH /profiles/{name}`
-- `POST /profiles/{name}/pause`
-- `POST /profiles/{name}/resume`
-- `DELETE /profiles/{name}`
-- `GET /repositories/{owner}/{repo}/profiles`
-- `PUT /repositories/{owner}/{repo}/profiles`
-- `GET /repository-policies`
-- `POST /repository-policies`
-- `PATCH /repository-policies/{id}`
-- `DELETE /repository-policies/{id}`
-- `GET /runner-requests`
-- `GET /runner-requests/{id}`
-- `GET /runner-requests/{id}/events`
-- `POST /runner-requests/{id}/retry`
-- `POST /runner-requests/{id}/stop`
+- `GET /runner_specs`
+- `POST /runner_specs`
+- `GET /runner_specs/{name}`
+- `PATCH /runner_specs/{name}`
+- `POST /runner_specs/{name}/pause`
+- `POST /runner_specs/{name}/resume`
+- `DELETE /runner_specs/{name}`
+- `GET /repositories/{owner}/{repo}/runner_specs`
+- `PUT /repositories/{owner}/{repo}/runner_specs`
+- `GET /runner_policies`
+- `POST /runner_policies`
+- `PATCH /runner_policies/{id}`
+- `DELETE /runner_policies/{id}`
+- `GET /runner_requests`
+- `GET /runner_requests/{id}`
+- `GET /runner_requests/{id}/events`
+- `POST /runner_requests/{id}/retry`
+- `POST /runner_requests/{id}/stop`
 - `GET /admin/config`
 - `POST /admin/config/reload`
 - `GET /audit-events`
@@ -545,7 +545,7 @@ admin UI 不应该只展示 runner 列表。它应该覆盖控制面日常操作
    - 管理 labels、template id、runner group、max concurrency、min idle、priority。
    - pause/resume profile。
    - 显示 profile 当前被哪些 repository policies 引用。
-4. **Repository Policies**
+4. **Runner Policies**
    - 为仓库配置 allowed profiles。
    - 显示某个仓库当前可用的 profiles。
    - 提供 label 匹配测试：输入 repo + labels，展示会命中哪个 profile，以及拒绝原因。
@@ -606,6 +606,9 @@ github:
   app:
     app_id: 123456
     private_key_file: ./secrets/github-app.pem
+  runner_policies:
+    - repository: jimyag/*
+      runner_specs: [default]
 
 sandbox:
   api_url: http://10.210.10.32:50001
@@ -620,7 +623,7 @@ diagnostics:
   pprof_package: github.com/jimmicro/pprof
   expose_admin_summary: true
 
-profiles:
+runner_specs:
   - name: default
     labels: [self-hosted, e2b]
     template_id: base
@@ -636,11 +639,11 @@ profiles:
     min_idle: 1
     enabled: true
 
-repository_policies:
+runner_policies:
   - repository: jimyag/template-repository
-    allowed_profiles: [default]
+    allowed_specs: [default]
   - repository: jimyag/heavy-repository
-    allowed_profiles: [default, large]
+    allowed_specs: [default, large]
 ```
 
 ## 10. 分阶段实现建议
@@ -672,7 +675,7 @@ repository_policies:
 ### Phase 4：metrics / diagnostics 和 GitHub App
 
 - 引入 `github.com/jimmicro/pprof` 作为本地 pprof/expvar 诊断入口。
-- 用 `expvar` 注册 Fireactions 风格 profile/pool 指标。
+- 用 `expvar` 注册 Fireactions 风格 spec/pool 指标。
 - 用 `expvar` 注册 ARC 风格 workflow job 指标。
 - 增加 GitHub App 鉴权，并用 installation token 申请 runner registration token。
 - admin UI 增加 diagnostics 页面，展示 DB、GitHub App、sandbox API、pprof 地址、dump 脚本、`/debug/vars` 摘要和最近失败事件。

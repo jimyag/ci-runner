@@ -19,6 +19,7 @@ type StartInput struct {
 	Labels            []string
 	TemplateID        string
 	Timeout           time.Duration
+	CommandContext    context.Context
 	OnStdout          func([]byte)
 	OnStderr          func([]byte)
 	OnExit            func(ExitResult, error)
@@ -78,9 +79,13 @@ func (s *E2BService) StartRunner(ctx context.Context, input StartInput) (StartRe
 		_ = sb.Kill(ctx)
 		return StartResult{}, fmt.Errorf("write runner script: %w", err)
 	}
+	commandCtx := input.CommandContext
+	if commandCtx == nil {
+		commandCtx = context.Background()
+	}
 	cmd := "chmod +x /tmp/start-github-runner.sh && /tmp/start-github-runner.sh"
 	handle, err := sb.Commands().Start(
-		ctx, cmd,
+		commandCtx, cmd,
 		qnsandbox.WithTag("github-runner"),
 		qnsandbox.WithOnStdout(input.OnStdout),
 		qnsandbox.WithOnStderr(input.OnStderr),

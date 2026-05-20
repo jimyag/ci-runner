@@ -1,4 +1,4 @@
-import { Activity, CirclePlus, Github, ListTree, RefreshCw, Server, Terminal } from "lucide-react"
+import { Activity, ClipboardList, Github, ListTree, Route, ScrollText, Server, Settings2, Stethoscope, Terminal } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -14,20 +14,31 @@ import {
 } from "@/components/ui/sidebar"
 
 type AppSidebarProps = {
+  section: string
   connected: boolean
   activeCount: number
-  onRefresh: () => void
-  onCreateFocus: () => void
+  onSectionChange: (section: string) => void
   onClearToken: () => void
 }
 
 export function AppSidebar({
+  section,
   connected,
   activeCount,
-  onRefresh,
-  onCreateFocus,
+  onSectionChange,
   onClearToken,
 }: AppSidebarProps) {
+  const items = [
+    { id: "overview", label: "Overview", icon: Activity },
+    { id: "runner_requests", label: "Runner Requests", icon: ListTree },
+    { id: "runner_specs", label: "Runner Specs", icon: Settings2 },
+    { id: "runner_groups", label: "Runner Groups", icon: Server },
+    { id: "runner_policies", label: "Runner Policies", icon: Route },
+    { id: "match", label: "Match Test", icon: ClipboardList },
+    { id: "audit", label: "Audit", icon: ScrollText },
+    { id: "diagnostics", label: "Diagnostics", icon: Stethoscope },
+  ]
+
   return (
     <Sidebar collapsible="offcanvas">
       <SidebarHeader>
@@ -56,24 +67,21 @@ export function AppSidebar({
         <SidebarGroup>
           <SidebarGroupContent>
             <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton isActive className="data-[active=true]:bg-primary/10 data-[active=true]:text-primary data-[active=true]:shadow-sm">
-                  <ListTree className="text-sidebar-primary" />
-                  <span className="font-medium">Runners</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-              <SidebarMenuItem>
-                <SidebarMenuButton onClick={onCreateFocus}>
-                  <CirclePlus className="text-sidebar-primary" />
-                  <span className="font-medium">Create</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
-              <SidebarMenuItem>
-                <SidebarMenuButton onClick={onRefresh}>
-                  <RefreshCw className="text-sidebar-primary" />
-                  <span className="font-medium">Refresh</span>
-                </SidebarMenuButton>
-              </SidebarMenuItem>
+              {items.map((item) => {
+                const Icon = item.icon
+                return (
+                  <SidebarMenuItem key={item.id}>
+                    <SidebarMenuButton
+                      isActive={section === item.id}
+                      className="data-[active=true]:bg-primary/10 data-[active=true]:text-primary data-[active=true]:shadow-sm"
+                      onClick={() => onSectionChange(item.id)}
+                    >
+                      <Icon className="text-sidebar-primary" />
+                      <span className="font-medium">{item.label}</span>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                )
+              })}
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>

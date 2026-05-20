@@ -1,0 +1,67 @@
+server:
+  http_addr: ":25500"
+  read_timeout_seconds: 15
+  write_timeout_seconds: 60
+  idle_timeout_seconds: 120
+
+database:
+  backend: sqlite
+  url: ./var/runnerd.db
+
+admin:
+  token: change-me
+
+e2b:
+  api_key: your-e2b-api-key
+  api_url: https://api.e2b.dev
+  domain: your.e2b.domain
+  template_id: github-runner-ubuntu-24.04
+  timeout_seconds: 3600
+  api_timeout_seconds: 60
+  create_timeout_seconds: 120
+  stop_timeout_seconds: 30
+
+github:
+  webhook_secret: change-me
+  api_base_url: https://api.github.com
+  scope: repo
+  # owner/repo are optional defaults for manual requests only.
+  # Webhook requests use repository.full_name from GitHub and are admitted by runner_policies.
+  owner: ""
+  repo: ""
+  app:
+    id: 123456
+    installation_id: 12345678
+    private_key_file: ./secrets/github-app.pem
+
+worker:
+  runner_labels:
+    - self-hosted
+    - e2b
+  max_concurrent_runners: 100
+  runner_idle_timeout_seconds: 300
+  recovery_timeout_seconds: 120
+  lease_ttl_seconds: 300
+  retry_base_delay_seconds: 15
+  retry_max_delay_seconds: 300
+  retry_max_attempts: 5
+
+runner_specs:
+  - name: default
+    labels: [self-hosted, e2b]
+    template_id: github-runner-ubuntu-24.04
+    max_concurrency: 100
+    min_idle: 0
+    priority: 0
+    enabled: true
+    default_available: true
+
+runner_groups:
+  - name: default
+    description: Default runner specs for installed repositories.
+    spec_names: [default]
+    enabled: true
+
+runner_policies:
+  - repository: your-org/*
+    allowed_groups: [default]

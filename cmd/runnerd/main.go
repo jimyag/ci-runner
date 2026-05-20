@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -16,36 +17,37 @@ import (
 )
 
 func main() {
+	configPath := flag.String("config", "runnerd.yaml", "path to runnerd config file")
+	flag.Parse()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	cfg, err := config.Load()
+	cfg, err := config.Load(*configPath)
 	if err != nil {
 		logger.Error("load config", "error", err)
 		os.Exit(1)
 	}
-	store := state.New(cfg.StateDir)
+	store := state.NewWithOptions(state.Options{
+		Backend:        cfg.StateBackend,
+		DatabaseURL:    cfg.StateDatabaseURL,
+		MigrateOnStart: true,
+	})
 	if err := store.Ensure(); err != nil {
-		logger.Error("ensure state dir", "error", err)
+		logger.Error("ensure state store", "error", err)
 		os.Exit(1)
 	}
-	if err := seedProfilesAndPolicies(store, cfg); err != nil {
-		logger.Error("seed profiles and policies", "error", err)
+	if err := seedRunnerSpecsAndPolicies(store, cfg); err != nil {
+		logger.Error("seed runner specs and policies", "error", err)
 		os.Exit(1)
 	}
 	githubHTTPClient := &http.Client{Timeout: 30 * time.Second}
-	sandboxHTTPClient := &http.Client{Timeout: cfg.SandboxAPITimeout}
-	var gh *github.Client
-	if cfg.GitHubAuthMode() == "app" {
-		gh, err = github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
-			AppID:          cfg.GitHubAppID,
-			InstallationID: cfg.GitHubAppInstallationID,
-			PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
-		}, githubHTTPClient)
-		if err != nil {
-			logger.Error("create github app client", "error", err)
-			os.Exit(1)
-		}
-	} else {
-		gh = github.NewClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, githubHTTPClient)
+	sandboxHTTPClient := &http.Client{}
+	gh, err := github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
+		AppID:          cfg.GitHubAppID,
+		InstallationID: cfg.GitHubAppInstallationID,
+		PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
+	}, githubHTTPClient)
+	if err != nil {
+		logger.Error("create github app client", "error", err)
+		os.Exit(1)
 	}
 	sb, err := sandboxrunner.NewE2BService(cfg.E2BAPIKey, cfg.E2BAPIURL, sandboxHTTPClient)
 	if err != nil {
@@ -69,33 +71,69 @@ func main() {
 		IdleTimeout:       cfg.HTTPIdleTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
-	logger.Info("starting server", "addr", cfg.HTTPAddr, "state_dir", cfg.StateDir)
+	logger.Info("starting server", "addr", cfg.HTTPAddr, "state_backend", cfg.StateBackend, "state_database_url", cfg.StateDatabaseURL)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func seedProfilesAndPolicies(store state.Store, cfg config.Config) error {
-	for _, profile := range cfg.Profiles {
+func seedRunnerSpecsAndPolicies(store state.Store, cfg config.Config) error {
+	for _, spec := range cfg.RunnerSpecs {
+		if _, err := store.GetProfile(spec.Name); err == nil {
+			continue
+		}
 		if _, err := store.UpsertProfile(state.RunnerProfile{
-			Name:           profile.Name,
-			Labels:         profile.Labels,
-			TemplateID:     profile.TemplateID,
-			RunnerGroup:    profile.RunnerGroup,
-			MaxConcurrency: profile.MaxConcurrency,
-			MinIdle:        profile.MinIdle,
-			Priority:       profile.Priority,
-			Enabled:        profile.Enabled,
+			Name:             spec.Name,
+			Labels:           spec.Labels,
+			TemplateID:       spec.TemplateID,
+			RunnerGroup:      spec.RunnerGroup,
+			MaxConcurrency:   spec.MaxConcurrency,
+			MinIdle:          spec.MinIdle,
+			Priority:         spec.Priority,
+			Enabled:          spec.Enabled,
+			DefaultAvailable: spec.DefaultAvailable,
 		}); err != nil {
 			return err
 		}
 	}
-	for _, policy := range cfg.RepositoryPolicies {
-		for _, profileName := range policy.AllowedProfiles {
+	for _, group := range cfg.RunnerGroups {
+		if _, err := store.GetRunnerGroup(group.Name); err == nil {
+			continue
+		}
+		if _, err := store.UpsertRunnerGroup(state.RunnerGroup{
+			Name:        group.Name,
+			Description: group.Description,
+			SpecNames:   group.SpecNames,
+			Enabled:     group.Enabled,
+		}); err != nil {
+			return err
+		}
+	}
+	existingPolicies, err := store.ListRepositoryPolicies()
+	if err != nil {
+		return err
+	}
+	for _, policy := range cfg.RunnerPolicies {
+		for _, specName := range policy.AllowedSpecs {
+			if repositoryPolicyExists(existingPolicies, policy.Repository, specName) {
+				continue
+			}
 			if _, err := store.UpsertRepositoryPolicy(state.RepositoryPolicy{
 				RepositoryFullName: policy.Repository,
-				ProfileName:        profileName,
+				ProfileName:        specName,
+				Enabled:            true,
+			}); err != nil {
+				return err
+			}
+		}
+		for _, groupName := range policy.AllowedGroups {
+			if repositoryGroupPolicyExists(existingPolicies, policy.Repository, groupName) {
+				continue
+			}
+			if _, err := store.UpsertRepositoryPolicy(state.RepositoryPolicy{
+				RepositoryFullName: policy.Repository,
+				RunnerGroupName:    groupName,
 				Enabled:            true,
 			}); err != nil {
 				return err
@@ -103,4 +141,22 @@ func seedProfilesAndPolicies(store state.Store, cfg config.Config) error {
 		}
 	}
 	return nil
+}
+
+func repositoryPolicyExists(policies []state.RepositoryPolicy, repository, profileName string) bool {
+	for _, policy := range policies {
+		if policy.RepositoryFullName == repository && policy.ProfileName == profileName {
+			return true
+		}
+	}
+	return false
+}
+
+func repositoryGroupPolicyExists(policies []state.RepositoryPolicy, repository, groupName string) bool {
+	for _, policy := range policies {
+		if policy.RepositoryFullName == repository && policy.RunnerGroupName == groupName {
+			return true
+		}
+	}
+	return false
 }

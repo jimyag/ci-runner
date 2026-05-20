@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import {
   AlertCircle,
   CheckCircle2,
@@ -27,6 +27,21 @@ import {
 import { Input } from "@/components/ui/input"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   Table,
   TableBody,
   TableCell,
@@ -44,7 +59,8 @@ type RunnerState = {
   id: string
   status: RunnerStatus
   repository_full_name?: string
-  profile_name?: string
+  requested_labels?: string[]
+  runner_spec_name?: string
   runner_group?: string
   runner_name: string
   sandbox_id?: string
@@ -54,12 +70,17 @@ type RunnerState = {
   error?: string
   failure_stage?: string
   failure_reason?: string
+  last_error_code?: string
+  last_error_message?: string
+  last_error_retryable?: boolean
+  retry_count?: number
   updated_at: string
   created_at: string
+  next_retry_at?: string
   completed_at?: string
 }
 
-type RunnerProfile = {
+type RunnerSpec = {
   name: string
   labels: string[]
   template_id: string
@@ -68,22 +89,33 @@ type RunnerProfile = {
   min_idle: number
   priority: number
   enabled: boolean
+  default_available: boolean
   created_at: string
   updated_at: string
 }
 
-type RepositoryPolicy = {
+type RunnerPolicy = {
   id: number
   repository_full_name: string
-  profile_name: string
+  runner_spec_name?: string
+  runner_group_name?: string
   enabled: boolean
   created_at: string
 }
 
-type ProfileMatch = {
+type RunnerGroup = {
+  name: string
+  description?: string
+  spec_names: string[]
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+type RunnerSpecMatch = {
   repository_full_name: string
   labels: string[]
-  profile?: RunnerProfile
+  runner_spec?: RunnerSpec
   reason?: string
 }
 
@@ -95,6 +127,16 @@ type DiagnosticsSummary = {
   recent_failures: RunnerState[]
 }
 
+type AuditEvent = {
+  id: number
+  actor: string
+  action: string
+  resource_type: string
+  resource_id: string
+  payload_json?: string
+  created_at: string
+}
+
 type Metric = {
   label: string
   value: number
@@ -104,50 +146,97 @@ type Metric = {
 const tokenKey = "runnerd-admin-token"
 const activeStatuses = new Set<RunnerStatus>(["queued", "creating", "running", "stopping"])
 const logNames = ["control.log", "stdout.log", "stderr.log"] as const
+const adminSections = [
+  "overview",
+  "runner_requests",
+  "runner_specs",
+  "runner_groups",
+  "runner_policies",
+  "match",
+  "audit",
+  "diagnostics",
+] as const
+
+type AdminSection = (typeof adminSections)[number]
+
+function sectionFromPath(): AdminSection {
+  const slug = window.location.pathname.replace(/^\/admin\/?/, "") || "overview"
+  return adminSections.includes(slug as AdminSection) ? (slug as AdminSection) : "overview"
+}
 
 function App() {
   const [token, setTokenState] = useState(() => localStorage.getItem(tokenKey) || "")
   const [tokenInput, setTokenInput] = useState("")
-  const [section, setSection] = useState("overview")
+  const [section, setSectionState] = useState<AdminSection>(() => sectionFromPath())
   const [runners, setRunners] = useState<RunnerState[]>([])
-  const [profiles, setProfiles] = useState<RunnerProfile[]>([])
-  const [policies, setPolicies] = useState<RepositoryPolicy[]>([])
+  const [runnerSpecs, setRunnerSpecs] = useState<RunnerSpec[]>([])
+  const [runnerGroups, setRunnerGroups] = useState<RunnerGroup[]>([])
+  const [runnerPolicies, setRunnerPolicies] = useState<RunnerPolicy[]>([])
   const [selectedID, setSelectedID] = useState("")
   const [selectedLog, setSelectedLog] = useState<(typeof logNames)[number]>("control.log")
   const [logText, setLogText] = useState("No runner selected")
   const [loading, setLoading] = useState(false)
   const [connected, setConnected] = useState(false)
-  const [lastUpdated, setLastUpdated] = useState("")
   const [createID, setCreateID] = useState("")
   const [createRepository, setCreateRepository] = useState("")
-  const [createProfile, setCreateProfile] = useState("")
+  const [createRunnerSpec, setCreateRunnerSpec] = useState("")
   const [createLabels, setCreateLabels] = useState("self-hosted,e2b")
-  const [profileForm, setProfileForm] = useState({
+  const [createRunnerOpen, setCreateRunnerOpen] = useState(false)
+  const [runnerSpecOpen, setRunnerSpecOpen] = useState(false)
+  const [runnerGroupOpen, setRunnerGroupOpen] = useState(false)
+  const [runnerPolicyOpen, setRunnerPolicyOpen] = useState(false)
+  const [runnerSpecForm, setRunnerSpecForm] = useState({
     name: "",
     labels: "self-hosted,e2b",
     template_id: "",
-    runner_group: "default",
+    group_names: [] as string[],
     max_concurrency: "10",
     min_idle: "0",
     priority: "0",
     enabled: true,
+    default_available: true,
   })
-  const [policyForm, setPolicyForm] = useState({
+  const [runnerPolicyForm, setPolicyForm] = useState({
     id: 0,
     repository_full_name: "",
-    profile_name: "",
+    target_type: "spec",
+    runner_spec_name: "",
+    runner_group_name: "",
+    enabled: true,
+  })
+  const [runnerGroupForm, setRunnerGroupForm] = useState({
+    name: "",
+    description: "",
+    spec_names: [] as string[],
     enabled: true,
   })
   const [matchRepository, setMatchRepository] = useState("")
   const [matchLabels, setMatchLabels] = useState("self-hosted,e2b")
-  const [matchResult, setMatchResult] = useState<ProfileMatch | null>(null)
+  const [matchResult, setMatchResult] = useState<RunnerSpecMatch | null>(null)
   const [diagnostics, setDiagnostics] = useState<DiagnosticsSummary | null>(null)
   const [diagnosticsVars, setDiagnosticsVars] = useState("")
-  const createIDRef = useRef<HTMLInputElement>(null)
+  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([])
+
+  const setSection = useCallback((next: string) => {
+    const section = adminSections.includes(next as AdminSection) ? (next as AdminSection) : "overview"
+    setSectionState(section)
+    const nextPath = section === "overview" ? "/admin/" : `/admin/${section}`
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState(null, "", nextPath)
+    }
+  }, [])
 
   const selected = useMemo(
     () => runners.find((runner) => runner.id === selectedID),
     [runners, selectedID]
+  )
+
+  const groupNamesForSpec = useCallback(
+    (specName: string) =>
+      runnerGroups
+        .filter((group) => group.spec_names.includes(specName))
+        .map((group) => group.name),
+    [runnerGroups]
   )
 
   const metrics = useMemo<Metric[]>(() => {
@@ -160,9 +249,9 @@ function App() {
       },
       { label: "Completed", value: count("completed"), description: "cleaned after exit" },
       { label: "Failed", value: count("failed"), description: "needs inspection" },
-      { label: "Profiles", value: profiles.length, description: "active control-plane profiles" },
+      { label: "Runner specs", value: runnerSpecs.length, description: "active control-plane runner specs" },
     ]
-  }, [profiles.length, runners])
+  }, [runnerSpecs.length, runners])
 
   const setToken = useCallback((value: string) => {
     const next = value.trim()
@@ -207,7 +296,7 @@ function App() {
       setLogText("Loading...")
       try {
         const text = (await request(
-          `/runners/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`
+          `/runner_requests/${encodeURIComponent(id)}/logs/${encodeURIComponent(name)}`
         )) as string
         setLogText(text || "Log is empty")
       } catch (error) {
@@ -224,17 +313,20 @@ function App() {
     }
     setLoading(true)
     try {
-      const [runnerData, profileData, policyData] = await Promise.all([
-        request("/runners"),
-        request("/profiles"),
-        request("/repository-policies"),
+      const [runnerData, runnerSpecData, runnerGroupData, policyData, auditData] = await Promise.all([
+        request("/runner_requests"),
+        request("/runner_specs"),
+        request("/runner_groups"),
+        request("/runner_policies"),
+        request("/audit-events"),
       ])
       const nextRunners = Array.isArray(runnerData) ? (runnerData as RunnerState[]) : []
       setRunners(nextRunners)
-      setProfiles(Array.isArray(profileData) ? (profileData as RunnerProfile[]) : [])
-      setPolicies(Array.isArray(policyData) ? (policyData as RepositoryPolicy[]) : [])
+      setRunnerSpecs(Array.isArray(runnerSpecData) ? (runnerSpecData as RunnerSpec[]) : [])
+      setRunnerGroups(Array.isArray(runnerGroupData) ? (runnerGroupData as RunnerGroup[]) : [])
+      setRunnerPolicies(Array.isArray(policyData) ? (policyData as RunnerPolicy[]) : [])
+      setAuditEvents(Array.isArray(auditData) ? (auditData as AuditEvent[]) : [])
       setConnected(true)
-      setLastUpdated(new Date().toLocaleTimeString())
       if (selectedID && !nextRunners.some((runner) => runner.id === selectedID)) {
         setSelectedID("")
         setLogText("No runner selected")
@@ -249,6 +341,12 @@ function App() {
 
   useEffect(() => {
     void fetch("/healthz").catch(() => setConnected(false))
+  }, [])
+
+  useEffect(() => {
+    const handlePopState = () => setSectionState(sectionFromPath())
+    window.addEventListener("popstate", handlePopState)
+    return () => window.removeEventListener("popstate", handlePopState)
   }, [])
 
   useEffect(() => {
@@ -287,10 +385,41 @@ function App() {
   const clearToken = () => {
     setToken("")
     setRunners([])
-    setProfiles([])
-    setPolicies([])
+    setRunnerSpecs([])
+    setRunnerGroups([])
+    setRunnerPolicies([])
+    setAuditEvents([])
     setSelectedID("")
     setLogText("No runner selected")
+  }
+
+  const resetCreateRunnerForm = () => {
+    setCreateID("")
+    setCreateRepository("")
+    setCreateRunnerSpec("")
+    setCreateLabels("self-hosted,e2b")
+  }
+
+  const resetRunnerSpecForm = () => {
+    setRunnerSpecForm({
+      name: "",
+      labels: "self-hosted,e2b",
+      template_id: "",
+      group_names: runnerGroups[0]?.name ? [runnerGroups[0].name] : [],
+      max_concurrency: "10",
+      min_idle: "0",
+      priority: "0",
+      enabled: true,
+      default_available: true,
+    })
+  }
+
+  const resetRunnerPolicyForm = () => {
+    setPolicyForm({ id: 0, repository_full_name: "", target_type: "spec", runner_spec_name: "", runner_group_name: "", enabled: true })
+  }
+
+  const resetRunnerGroupForm = () => {
+    setRunnerGroupForm({ name: "", description: "", spec_names: [], enabled: true })
   }
 
   const createRunner = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -302,21 +431,22 @@ function App() {
     const body: {
       id?: string
       repository_full_name?: string
-      profile_name?: string
+      runner_spec_name?: string
       labels?: string[]
     } = {}
     if (createID.trim()) body.id = createID.trim()
     if (createRepository.trim()) body.repository_full_name = createRepository.trim()
-    if (createProfile.trim()) body.profile_name = createProfile.trim()
+    if (createRunnerSpec.trim()) body.runner_spec_name = createRunnerSpec.trim()
     const labels = parseLabels(createLabels)
     if (labels.length > 0) body.labels = labels
     try {
-      const runner = (await request("/runners", {
+      const runner = (await request("/runner_requests", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       })) as RunnerState
-      setCreateID("")
+      resetCreateRunnerForm()
+      setCreateRunnerOpen(false)
       setSelectedID(runner.id)
       toast.success(`Runner ${runner.id} queued`)
       await loadAll()
@@ -327,7 +457,7 @@ function App() {
 
   const stopRunner = async (id: string) => {
     try {
-      const runner = (await request(`/runners/${encodeURIComponent(id)}`, {
+      const runner = (await request(`/runner_requests/${encodeURIComponent(id)}`, {
         method: "DELETE",
       })) as RunnerState
       setSelectedID(runner.id)
@@ -338,127 +468,221 @@ function App() {
     }
   }
 
-  const saveProfile = async (event: React.FormEvent<HTMLFormElement>) => {
+  const retryRunner = async (id: string) => {
+    try {
+      const runner = (await request(`/runner_requests/${encodeURIComponent(id)}/retry`, {
+        method: "POST",
+      })) as RunnerState
+      setSelectedID(runner.id)
+      toast.success(`Runner ${runner.id} requeued`)
+      await loadAll()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to retry runner")
+    }
+  }
+
+  const saveRunnerSpec = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     try {
-      const payload = {
-        name: profileForm.name.trim(),
-        labels: parseLabels(profileForm.labels),
-        template_id: profileForm.template_id.trim(),
-        runner_group: profileForm.runner_group.trim(),
-        max_concurrency: Number(profileForm.max_concurrency) || 0,
-        min_idle: Number(profileForm.min_idle) || 0,
-        priority: Number(profileForm.priority) || 0,
-        enabled: profileForm.enabled,
+      if (runnerSpecForm.group_names.length === 0) {
+        toast.error("Select at least one runner group")
+        return
       }
-      const isUpdate = profiles.some((profile) => profile.name === payload.name)
-      const url = isUpdate ? `/profiles/${encodeURIComponent(payload.name)}` : "/profiles"
+      const payload = {
+        name: runnerSpecForm.name.trim(),
+        labels: parseLabels(runnerSpecForm.labels),
+        template_id: runnerSpecForm.template_id.trim(),
+        runner_group: runnerSpecForm.group_names[0] || "",
+        max_concurrency: Number(runnerSpecForm.max_concurrency) || 0,
+        min_idle: Number(runnerSpecForm.min_idle) || 0,
+        priority: Number(runnerSpecForm.priority) || 0,
+        enabled: runnerSpecForm.enabled,
+        default_available: runnerSpecForm.default_available,
+      }
+      const isUpdate = runnerSpecs.some((runnerSpec) => runnerSpec.name === payload.name)
+      const url = isUpdate ? `/runner_specs/${encodeURIComponent(payload.name)}` : "/runner_specs"
       const method = isUpdate ? "PATCH" : "POST"
       await request(url, {
         method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       })
-      toast.success(`Profile ${payload.name} saved`)
+      await Promise.all(
+        runnerGroups.map((group) => {
+          const shouldContain = runnerSpecForm.group_names.includes(group.name)
+          const currentSpecs = new Set(group.spec_names)
+          if (shouldContain) currentSpecs.add(payload.name)
+          else currentSpecs.delete(payload.name)
+          return request(`/runner_groups/${encodeURIComponent(group.name)}`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              spec_names: Array.from(currentSpecs).sort(),
+              enabled: group.enabled,
+            }),
+          })
+        })
+      )
+      toast.success(`Runner spec ${payload.name} saved`)
+      setRunnerSpecOpen(false)
       await loadAll()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to save profile")
+      toast.error(error instanceof Error ? error.message : "Failed to save runner spec")
     }
   }
 
-  const loadProfileIntoForm = (profile: RunnerProfile) => {
-    setSection("profiles")
-    setProfileForm({
-      name: profile.name,
-      labels: profile.labels.join(","),
-      template_id: profile.template_id,
-      runner_group: profile.runner_group || "",
-      max_concurrency: String(profile.max_concurrency),
-      min_idle: String(profile.min_idle),
-      priority: String(profile.priority),
-      enabled: profile.enabled,
+  const loadRunnerSpecIntoForm = (runnerSpec: RunnerSpec) => {
+    setSection("runner_specs")
+    setRunnerSpecForm({
+      name: runnerSpec.name,
+      labels: runnerSpec.labels.join(","),
+      template_id: runnerSpec.template_id,
+      group_names: runnerGroups
+        .filter((group) => group.spec_names.includes(runnerSpec.name))
+        .map((group) => group.name),
+      max_concurrency: String(runnerSpec.max_concurrency),
+      min_idle: String(runnerSpec.min_idle),
+      priority: String(runnerSpec.priority),
+      enabled: runnerSpec.enabled,
+      default_available: runnerSpec.default_available,
     })
+    setRunnerSpecOpen(true)
   }
 
-  const deleteProfile = async (name: string) => {
+  const deleteRunnerSpec = async (name: string) => {
     try {
-      await request(`/profiles/${encodeURIComponent(name)}`, { method: "DELETE" })
-      toast.success(`Profile ${name} deleted`)
-      if (profileForm.name === name) {
-        setProfileForm({
-          name: "",
-          labels: "self-hosted,e2b",
-          template_id: "",
-          runner_group: "default",
-          max_concurrency: "10",
-          min_idle: "0",
-          priority: "0",
-          enabled: true,
-        })
+      await request(`/runner_specs/${encodeURIComponent(name)}`, { method: "DELETE" })
+      toast.success(`Runner spec ${name} deleted`)
+      if (runnerSpecForm.name === name) {
+        resetRunnerSpecForm()
       }
       await loadAll()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to delete profile")
+      toast.error(error instanceof Error ? error.message : "Failed to delete runner spec")
+    }
+  }
+
+  const saveRunnerGroup = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    try {
+      const payload = {
+        name: runnerGroupForm.name.trim(),
+        description: runnerGroupForm.description.trim(),
+        spec_names: runnerGroupForm.spec_names,
+        enabled: runnerGroupForm.enabled,
+      }
+      const isUpdate = runnerGroups.some((group) => group.name === payload.name)
+      const url = isUpdate ? `/runner_groups/${encodeURIComponent(payload.name)}` : "/runner_groups"
+      const method = isUpdate ? "PATCH" : "POST"
+      await request(url, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+      toast.success(`Runner group ${payload.name} saved`)
+      setRunnerGroupOpen(false)
+      await loadAll()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to save runner group")
+    }
+  }
+
+  const loadRunnerGroupIntoForm = (group: RunnerGroup) => {
+    setSection("runner_groups")
+    setRunnerGroupForm({
+      name: group.name,
+      description: group.description || "",
+      spec_names: [...group.spec_names],
+      enabled: group.enabled,
+    })
+    setRunnerGroupOpen(true)
+  }
+
+  const deleteRunnerGroup = async (name: string) => {
+    try {
+      await request(`/runner_groups/${encodeURIComponent(name)}`, { method: "DELETE" })
+      toast.success(`Runner group ${name} deleted`)
+      if (runnerGroupForm.name === name) resetRunnerGroupForm()
+      await loadAll()
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to delete runner group")
     }
   }
 
   const savePolicy = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     try {
-      const payload = {
-        repository_full_name: policyForm.repository_full_name.trim(),
-        profile_name: policyForm.profile_name.trim(),
-        enabled: policyForm.enabled,
+      const payload: {
+        repository_full_name: string
+        runner_spec_name?: string
+        runner_group_name?: string
+        enabled: boolean
+      } = {
+        repository_full_name: runnerPolicyForm.repository_full_name.trim(),
+        enabled: runnerPolicyForm.enabled,
       }
-      const isUpdate = policyForm.id > 0
-      const url = isUpdate ? `/repository-policies/${policyForm.id}` : "/repository-policies"
+      if (runnerPolicyForm.target_type === "group") payload.runner_group_name = runnerPolicyForm.runner_group_name.trim()
+      else payload.runner_spec_name = runnerPolicyForm.runner_spec_name.trim()
+      const isUpdate = runnerPolicyForm.id > 0
+      const url = isUpdate ? `/runner_policies/${runnerPolicyForm.id}` : "/runner_policies"
       const method = isUpdate ? "PATCH" : "POST"
-      await request(url, {
+      const saved = (await request(url, {
         method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+      })) as RunnerPolicy
+      setRunnerPolicies((current) => {
+        const index = current.findIndex((policy) => policy.id === saved.id)
+        if (index === -1) return [saved, ...current]
+        const next = [...current]
+        next[index] = saved
+        return next
       })
-      toast.success("Repository policy saved")
+      toast.success(`Runner policy #${saved.id} saved`)
+      setRunnerPolicyOpen(false)
       await loadAll()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to save repository policy")
+      toast.error(error instanceof Error ? error.message : "Failed to save runner policy")
     }
   }
 
-  const loadPolicyIntoForm = (policy: RepositoryPolicy) => {
-    setSection("policies")
+  const loadPolicyIntoForm = (policy: RunnerPolicy) => {
+    setSection("runner_policies")
     setPolicyForm({
       id: policy.id,
       repository_full_name: policy.repository_full_name,
-      profile_name: policy.profile_name,
+      target_type: policy.runner_group_name ? "group" : "spec",
+      runner_spec_name: policy.runner_spec_name || "",
+      runner_group_name: policy.runner_group_name || "",
       enabled: policy.enabled,
     })
+    setRunnerPolicyOpen(true)
   }
 
   const deletePolicy = async (id: number) => {
     try {
-      await request(`/repository-policies/${id}`, { method: "DELETE" })
-      toast.success("Repository policy deleted")
-      if (policyForm.id === id) {
-        setPolicyForm({ id: 0, repository_full_name: "", profile_name: "", enabled: true })
+      await request(`/runner_policies/${id}`, { method: "DELETE" })
+      toast.success("Runner policy deleted")
+      if (runnerPolicyForm.id === id) {
+        resetRunnerPolicyForm()
       }
       await loadAll()
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Failed to delete repository policy")
+      toast.error(error instanceof Error ? error.message : "Failed to delete runner policy")
     }
   }
 
   const runMatchTest = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     try {
-      const result = (await request("/profiles/match-test", {
+      const result = (await request("/runner_specs/match", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           repository_full_name: matchRepository.trim(),
           labels: parseLabels(matchLabels),
         }),
-      })) as ProfileMatch
+      })) as RunnerSpecMatch
       setMatchResult(result)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to run match test")
@@ -474,10 +698,10 @@ function App() {
   return (
     <SidebarProvider>
       <AppSidebar
+        section={section}
         connected={connected}
         activeCount={metrics[0]?.value || 0}
-        onRefresh={() => void loadAll()}
-        onCreateFocus={() => createIDRef.current?.focus()}
+        onSectionChange={setSection}
         onClearToken={clearToken}
       />
       <SidebarInset>
@@ -518,33 +742,12 @@ function App() {
             ))}
           </div>
 
-          <Card className="py-4">
-            <CardContent className="flex flex-col gap-3 px-5 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <div className="text-sm font-medium">Control plane</div>
-                <div className="text-xs text-muted-foreground">
-                  {lastUpdated ? `Updated ${lastUpdated}` : "Waiting for control plane data"}
-                </div>
-              </div>
-              <Tabs value={section} onValueChange={setSection}>
-                <TabsList>
-                  <TabsTrigger value="overview">Overview</TabsTrigger>
-                  <TabsTrigger value="runners">Runner Requests</TabsTrigger>
-                  <TabsTrigger value="profiles">Profiles</TabsTrigger>
-                  <TabsTrigger value="policies">Repository Policies</TabsTrigger>
-                  <TabsTrigger value="match">Match Test</TabsTrigger>
-                  <TabsTrigger value="diagnostics">Diagnostics</TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </CardContent>
-          </Card>
-
           {section === "overview" ? (
             <div className="grid gap-4 xl:grid-cols-2">
               <Card>
                 <CardHeader>
                   <CardTitle>Recent runner requests</CardTitle>
-                  <CardDescription>Newest requests and their matched profiles.</CardDescription>
+                  <CardDescription>Newest requests and their matched runner specs.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   {runners.slice(0, 8).map((runner) => (
@@ -552,7 +755,7 @@ function App() {
                       <div className="min-w-0">
                         <div className="truncate font-medium">{runner.repository_full_name || runner.id}</div>
                         <div className="truncate text-xs text-muted-foreground">
-                          {runner.profile_name || "-"} · {runner.runner_name}
+                          {runner.runner_spec_name || "-"} · {runner.runner_name}
                         </div>
                       </div>
                       <StatusBadge status={runner.status} />
@@ -565,35 +768,35 @@ function App() {
               </Card>
               <Card>
                 <CardHeader>
-                  <CardTitle>Profiles and repository policies</CardTitle>
+                  <CardTitle>Runner specs and runner policies</CardTitle>
                   <CardDescription>Current seeded and runtime-managed routing rules.</CardDescription>
                 </CardHeader>
                 <CardContent className="grid gap-4 lg:grid-cols-2">
                   <div className="space-y-3">
-                    <div className="text-sm font-medium">Profiles</div>
-                    {profiles.map((profile) => (
+                    <div className="text-sm font-medium">Runner specs</div>
+                    {runnerSpecs.map((runnerSpec) => (
                       <div
-                        key={profile.name}
+                        key={runnerSpec.name}
                         className="rounded-md border p-3 text-sm"
-                        onClick={() => loadProfileIntoForm(profile)}
+                        onClick={() => loadRunnerSpecIntoForm(runnerSpec)}
                       >
-                        <div className="font-medium">{profile.name}</div>
+                        <div className="font-medium">{runnerSpec.name}</div>
                         <div className="text-xs text-muted-foreground">
-                          {profile.labels.join(", ")} · template {profile.template_id}
+                          {runnerSpec.labels.join(", ")} · template {runnerSpec.template_id}
                         </div>
                       </div>
                     ))}
                   </div>
                   <div className="space-y-3">
-                    <div className="text-sm font-medium">Repository policies</div>
-                    {policies.map((policy) => (
+                    <div className="text-sm font-medium">Runner policies</div>
+                    {runnerPolicies.map((policy) => (
                       <div
                         key={policy.id}
                         className="rounded-md border p-3 text-sm"
                         onClick={() => loadPolicyIntoForm(policy)}
                       >
                         <div className="font-medium">{policy.repository_full_name}</div>
-                        <div className="text-xs text-muted-foreground">{policy.profile_name}</div>
+                        <div className="text-xs text-muted-foreground">{policy.runner_spec_name}</div>
                       </div>
                     ))}
                   </div>
@@ -602,41 +805,27 @@ function App() {
             </div>
           ) : null}
 
-          {section === "runners" ? (
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
+          {section === "runner_requests" ? (
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(520px,640px)]">
               <Card className="min-w-0 gap-0 py-0">
                 <CardHeader className="border-b px-5 py-4">
                   <div className="flex flex-col gap-3">
-                    <div>
-                      <CardTitle>Runner Requests</CardTitle>
-                      <CardDescription>
-                        Webhook and manual requests with matched repository/policy context.
-                      </CardDescription>
-                    </div>
-                    <form className="grid gap-2 lg:grid-cols-4" onSubmit={createRunner}>
-                      <Input
-                        ref={createIDRef}
-                        value={createID}
-                        onChange={(event) => setCreateID(event.target.value)}
-                        placeholder="optional id"
-                      />
-                      <Input
-                        value={createRepository}
-                        onChange={(event) => setCreateRepository(event.target.value)}
-                        placeholder="owner/repo or owner/*"
-                      />
-                      <Input
-                        value={createProfile}
-                        onChange={(event) => setCreateProfile(event.target.value)}
-                        placeholder="optional profile"
-                      />
-                      <Input
-                        value={createLabels}
-                        onChange={(event) => setCreateLabels(event.target.value)}
-                        placeholder="self-hosted,e2b"
-                      />
-                      <div className="flex gap-2 lg:col-span-4">
-                        <Button type="submit" disabled={!token}>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                      <div>
+                        <CardTitle>Runner Requests</CardTitle>
+                        <CardDescription>
+                          Webhook and manual requests with matched runner policy context.
+                        </CardDescription>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          type="button"
+                          onClick={() => {
+                            resetCreateRunnerForm()
+                            setCreateRunnerOpen(true)
+                          }}
+                          disabled={!token}
+                        >
                           <Plus />
                           Create
                         </Button>
@@ -651,7 +840,47 @@ function App() {
                           <RefreshCw className={cn(loading && "animate-spin")} />
                         </Button>
                       </div>
-                    </form>
+                    </div>
+                    <Dialog open={createRunnerOpen} onOpenChange={setCreateRunnerOpen}>
+                      <DialogContent>
+                        <DialogHeader>
+                          <DialogTitle>Create runner request</DialogTitle>
+                          <DialogDescription>
+                            Manually enqueue a one-off runner request.
+                          </DialogDescription>
+                        </DialogHeader>
+                        <form className="grid gap-3" onSubmit={createRunner}>
+                          <Input
+                            value={createID}
+                            onChange={(event) => setCreateID(event.target.value)}
+                            placeholder="optional id"
+                          />
+                          <Input
+                            value={createRepository}
+                            onChange={(event) => setCreateRepository(event.target.value)}
+                            placeholder="owner/repo or owner/*"
+                          />
+                          <Input
+                            value={createRunnerSpec}
+                            onChange={(event) => setCreateRunnerSpec(event.target.value)}
+                            placeholder="optional runner spec"
+                          />
+                          <Input
+                            value={createLabels}
+                            onChange={(event) => setCreateLabels(event.target.value)}
+                            placeholder="self-hosted,e2b"
+                          />
+                          <DialogFooter>
+                            <Button type="button" variant="outline" onClick={() => setCreateRunnerOpen(false)}>
+                              Cancel
+                            </Button>
+                            <Button type="submit" disabled={!token}>
+                              Create
+                            </Button>
+                          </DialogFooter>
+                        </form>
+                      </DialogContent>
+                    </Dialog>
                   </div>
                 </CardHeader>
                 <CardContent className="p-0">
@@ -660,11 +889,11 @@ function App() {
                       <TableRow>
                         <TableHead>Status</TableHead>
                         <TableHead>Repository</TableHead>
-                        <TableHead>Profile</TableHead>
+                        <TableHead>Runner spec</TableHead>
                         <TableHead>Runner</TableHead>
                         <TableHead>Sandbox</TableHead>
                         <TableHead>Updated</TableHead>
-                        <TableHead className="w-24" />
+                        <TableHead className="w-36" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -688,7 +917,7 @@ function App() {
                             <TableCell className="max-w-[220px] truncate">
                               {runner.repository_full_name || "-"}
                             </TableCell>
-                            <TableCell>{runner.profile_name || "-"}</TableCell>
+                            <TableCell>{runner.runner_spec_name || "-"}</TableCell>
                             <TableCell>
                               <div className="font-medium">{runner.runner_name || runner.id}</div>
                               <div className="text-xs text-muted-foreground">{runner.id}</div>
@@ -698,18 +927,36 @@ function App() {
                             </TableCell>
                             <TableCell>{formatTime(runner.updated_at)}</TableCell>
                             <TableCell>
-                              <Button
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={(event) => {
-                                  event.stopPropagation()
-                                  void stopRunner(runner.id)
-                                }}
-                              >
-                                <Trash2 />
-                                Stop
-                              </Button>
+                              <div className="flex gap-2">
+                                {runner.status === "failed" ? (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      void retryRunner(runner.id)
+                                    }}
+                                  >
+                                    <RefreshCw />
+                                    Retry
+                                  </Button>
+                                ) : null}
+                                {activeStatuses.has(runner.status) ? (
+                                  <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={(event) => {
+                                      event.stopPropagation()
+                                      void stopRunner(runner.id)
+                                    }}
+                                  >
+                                    <Trash2 />
+                                    Stop
+                                  </Button>
+                                ) : null}
+                              </div>
                             </TableCell>
                           </TableRow>
                         ))
@@ -739,12 +986,12 @@ function App() {
                   </div>
                 </CardHeader>
                 {selected ? (
-                  <CardContent className="grid gap-4 p-5">
-                    <div className="grid grid-cols-[110px_minmax(0,1fr)] gap-x-3 gap-y-2 text-sm">
+                  <CardContent className="grid gap-5 p-5">
+                    <div className="space-y-2">
                       <Detail label="ID" value={selected.id} />
                       <Detail label="Status" value={selected.status} />
                       <Detail label="Repository" value={selected.repository_full_name || "-"} />
-                      <Detail label="Profile" value={selected.profile_name || "-"} />
+                      <Detail label="Runner spec" value={selected.runner_spec_name || "-"} />
                       <Detail label="Sandbox" value={selected.sandbox_id || "-"} />
                       <Detail label="PID" value={selected.process_pid || "-"} />
                       <Detail
@@ -754,24 +1001,51 @@ function App() {
                       <Detail label="Created" value={formatTime(selected.created_at)} />
                       <Detail label="Updated" value={formatTime(selected.updated_at)} />
                       <Detail label="Completed" value={formatTime(selected.completed_at)} />
+                      <Detail label="Retry count" value={selected.retry_count || "-"} />
+                      <Detail label="Next retry" value={formatTime(selected.next_retry_at)} />
+                      <Detail label="Requested labels" value={selected.requested_labels?.join(", ") || "-"} />
                       <Detail label="Failure" value={selected.failure_reason || "-"} />
+                      <Detail label="Last error code" value={selected.last_error_code || "-"} />
                       <Detail label="Error" value={selected.error || "-"} />
                     </div>
-                    <Tabs
-                      value={selectedLog}
-                      onValueChange={(value) => setSelectedLog(value as (typeof logNames)[number])}
-                    >
-                      <TabsList>
-                        {logNames.map((name) => (
-                          <TabsTrigger key={name} value={name}>
-                            {name.replace(".log", "")}
-                          </TabsTrigger>
-                        ))}
-                      </TabsList>
-                    </Tabs>
-                    <pre className="max-h-[48vh] min-h-72 overflow-auto rounded-lg border bg-muted/50 p-3 text-xs leading-relaxed whitespace-pre-wrap">
-                      {logText}
-                    </pre>
+                    {selected.status === "failed" ? (
+                      <Button type="button" variant="outline" onClick={() => void retryRunner(selected.id)}>
+                        <RefreshCw />
+                        Retry request
+                      </Button>
+                    ) : null}
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-medium">Logs</div>
+                          <div className="text-xs text-muted-foreground">control, stdout, and stderr captured by runnerd.</div>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => void loadLog(selected.id, selectedLog)}
+                        >
+                          <RefreshCw />
+                          Refresh
+                        </Button>
+                      </div>
+                      <Tabs
+                        value={selectedLog}
+                        onValueChange={(value) => setSelectedLog(value as (typeof logNames)[number])}
+                      >
+                        <TabsList>
+                          {logNames.map((name) => (
+                            <TabsTrigger key={name} value={name}>
+                              {name.replace(".log", "")}
+                            </TabsTrigger>
+                          ))}
+                        </TabsList>
+                      </Tabs>
+                      <pre className="max-h-[52vh] min-h-80 overflow-auto rounded-lg border bg-muted/50 p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">
+                        {logText}
+                      </pre>
+                    </div>
                   </CardContent>
                 ) : (
                   <CardContent className="p-8 text-sm text-muted-foreground">
@@ -782,88 +1056,41 @@ function App() {
             </div>
           ) : null}
 
-          {section === "profiles" ? (
-            <div className="grid gap-4 xl:grid-cols-[420px_minmax(0,1fr)]">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Profile editor</CardTitle>
-                  <CardDescription>Create or update runner profiles.</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <form className="grid gap-3" onSubmit={saveProfile}>
-                    <Input
-                      value={profileForm.name}
-                      onChange={(event) => setProfileForm((current) => ({ ...current, name: event.target.value }))}
-                      placeholder="profile name"
-                    />
-                    <Input
-                      value={profileForm.labels}
-                      onChange={(event) => setProfileForm((current) => ({ ...current, labels: event.target.value }))}
-                      placeholder="self-hosted,e2b"
-                    />
-                    <Input
-                      value={profileForm.template_id}
-                      onChange={(event) => setProfileForm((current) => ({ ...current, template_id: event.target.value }))}
-                      placeholder="template id"
-                    />
-                    <Input
-                      value={profileForm.runner_group}
-                      onChange={(event) => setProfileForm((current) => ({ ...current, runner_group: event.target.value }))}
-                      placeholder="runner group"
-                    />
-                    <div className="grid grid-cols-3 gap-2">
-                      <Input
-                        value={profileForm.max_concurrency}
-                        onChange={(event) => setProfileForm((current) => ({ ...current, max_concurrency: event.target.value }))}
-                        placeholder="max concurrency"
-                      />
-                      <Input
-                        value={profileForm.min_idle}
-                        onChange={(event) => setProfileForm((current) => ({ ...current, min_idle: event.target.value }))}
-                        placeholder="min idle"
-                      />
-                      <Input
-                        value={profileForm.priority}
-                        onChange={(event) => setProfileForm((current) => ({ ...current, priority: event.target.value }))}
-                        placeholder="priority"
-                      />
-                    </div>
-                    <label className="flex items-center gap-2 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={profileForm.enabled}
-                        onChange={(event) => setProfileForm((current) => ({ ...current, enabled: event.target.checked }))}
-                      />
-                      enabled
-                    </label>
-                    <div className="flex gap-2">
-                      <Button type="submit">Save profile</Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() =>
-                          setProfileForm({
-                            name: "",
-                            labels: "self-hosted,e2b",
-                            template_id: "",
-                            runner_group: "default",
-                            max_concurrency: "10",
-                            min_idle: "0",
-                            priority: "0",
-                            enabled: true,
-                          })
-                        }
-                      >
-                        Reset
-                      </Button>
-                    </div>
-                  </form>
-                </CardContent>
-              </Card>
+          {section === "runner_specs" ? (
+            <div className="grid gap-4">
               <Card className="min-w-0">
-                <CardHeader>
-                  <CardTitle>Profiles</CardTitle>
-                  <CardDescription>Click a profile to edit it.</CardDescription>
+                <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <CardTitle>Runner specs</CardTitle>
+                    <CardDescription>Click a runner spec row to edit it.</CardDescription>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      onClick={() => {
+                        if (runnerGroups.length === 0) {
+                          toast.error("Create a runner group before adding runner specs")
+                          setSection("runner_groups")
+                          return
+                        }
+                        resetRunnerSpecForm()
+                        setRunnerSpecOpen(true)
+                      }}
+                    >
+                      <Plus />
+                      Create
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => void loadAll()}
+                      disabled={loading}
+                      title="Refresh"
+                    >
+                      <RefreshCw className={cn(loading && "animate-spin")} />
+                    </Button>
+                  </div>
                 </CardHeader>
                 <CardContent className="p-0">
                   <Table>
@@ -872,19 +1099,21 @@ function App() {
                         <TableHead>Name</TableHead>
                         <TableHead>Labels</TableHead>
                         <TableHead>Template</TableHead>
-                        <TableHead>Runner group</TableHead>
+                        <TableHead>Runner groups</TableHead>
+                        <TableHead>Default</TableHead>
                         <TableHead>Limit</TableHead>
                         <TableHead className="w-24" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {profiles.map((profile) => (
-                        <TableRow key={profile.name} className="cursor-pointer" onClick={() => loadProfileIntoForm(profile)}>
-                          <TableCell>{profile.name}</TableCell>
-                          <TableCell className="max-w-[260px] truncate">{profile.labels.join(", ")}</TableCell>
-                          <TableCell>{profile.template_id}</TableCell>
-                          <TableCell>{profile.runner_group || "-"}</TableCell>
-                          <TableCell>{profile.max_concurrency}</TableCell>
+                      {runnerSpecs.map((runnerSpec) => (
+                        <TableRow key={runnerSpec.name} className="cursor-pointer" onClick={() => loadRunnerSpecIntoForm(runnerSpec)}>
+                          <TableCell>{runnerSpec.name}</TableCell>
+                          <TableCell className="max-w-[260px] truncate">{runnerSpec.labels.join(", ")}</TableCell>
+                          <TableCell>{runnerSpec.template_id}</TableCell>
+                          <TableCell>{groupNamesForSpec(runnerSpec.name).join(", ") || "-"}</TableCell>
+                          <TableCell>{runnerSpec.default_available ? "yes" : "no"}</TableCell>
+                          <TableCell>{runnerSpec.max_concurrency}</TableCell>
                           <TableCell>
                             <Button
                               type="button"
@@ -892,7 +1121,7 @@ function App() {
                               size="sm"
                               onClick={(event) => {
                                 event.stopPropagation()
-                                void deleteProfile(profile.name)
+                                void deleteRunnerSpec(runnerSpec.name)
                               }}
                             >
                               <Trash2 />
@@ -905,76 +1134,283 @@ function App() {
                   </Table>
                 </CardContent>
               </Card>
-            </div>
-          ) : null}
-
-          {section === "policies" ? (
-            <div className="grid gap-4 xl:grid-cols-[420px_minmax(0,1fr)]">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Repository policy editor</CardTitle>
-                  <CardDescription>Bind repositories to allowed profiles.</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <form className="grid gap-3" onSubmit={savePolicy}>
+              <Dialog open={runnerSpecOpen} onOpenChange={setRunnerSpecOpen}>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{runnerSpecForm.name ? "Edit runner spec" : "Create runner spec"}</DialogTitle>
+                    <DialogDescription>Define labels, template, group membership, and capacity.</DialogDescription>
+                  </DialogHeader>
+                  <form className="grid gap-3" onSubmit={saveRunnerSpec}>
                     <Input
-                      value={policyForm.repository_full_name}
-                      onChange={(event) =>
-                        setPolicyForm((current) => ({ ...current, repository_full_name: event.target.value }))
-                      }
-                      placeholder="owner/repo or owner/*"
+                      value={runnerSpecForm.name}
+                      onChange={(event) => setRunnerSpecForm((current) => ({ ...current, name: event.target.value }))}
+                      placeholder="runner spec name"
                     />
                     <Input
-                      value={policyForm.profile_name}
-                      onChange={(event) =>
-                        setPolicyForm((current) => ({ ...current, profile_name: event.target.value }))
-                      }
-                      placeholder="profile name"
+                      value={runnerSpecForm.labels}
+                      onChange={(event) => setRunnerSpecForm((current) => ({ ...current, labels: event.target.value }))}
+                      placeholder="self-hosted,e2b"
                     />
+                    <Input
+                      value={runnerSpecForm.template_id}
+                      onChange={(event) => setRunnerSpecForm((current) => ({ ...current, template_id: event.target.value }))}
+                      placeholder="template id"
+                    />
+                    <div className="grid gap-2 rounded-md border p-3">
+                      {runnerGroups.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">Create a runner group before saving runner specs.</div>
+                      ) : (
+                        runnerGroups.map((group) => (
+                          <label key={group.name} className="flex items-center gap-2 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={runnerSpecForm.group_names.includes(group.name)}
+                              onChange={(event) =>
+                                setRunnerSpecForm((current) => ({
+                                  ...current,
+                                  group_names: event.target.checked
+                                    ? [...current.group_names, group.name]
+                                    : current.group_names.filter((name) => name !== group.name),
+                                }))
+                              }
+                            />
+                            {group.name}
+                          </label>
+                        ))
+                      )}
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      <Input
+                        value={runnerSpecForm.max_concurrency}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, max_concurrency: event.target.value }))}
+                        placeholder="max concurrency"
+                      />
+                      <Input
+                        value={runnerSpecForm.min_idle}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, min_idle: event.target.value }))}
+                        placeholder="min idle"
+                      />
+                      <Input
+                        value={runnerSpecForm.priority}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, priority: event.target.value }))}
+                        placeholder="priority"
+                      />
+                    </div>
                     <label className="flex items-center gap-2 text-sm">
                       <input
                         type="checkbox"
-                        checked={policyForm.enabled}
-                        onChange={(event) => setPolicyForm((current) => ({ ...current, enabled: event.target.checked }))}
+                        checked={runnerSpecForm.enabled}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, enabled: event.target.checked }))}
                       />
                       enabled
                     </label>
-                    <div className="flex gap-2">
-                      <Button type="submit">Save policy</Button>
-                      <Button
-                        type="button"
-                        variant="outline"
-                        onClick={() =>
-                          setPolicyForm({ id: 0, repository_full_name: "", profile_name: "", enabled: true })
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={runnerSpecForm.default_available}
+                        onChange={(event) =>
+                          setRunnerSpecForm((current) => ({ ...current, default_available: event.target.checked }))
                         }
-                      >
-                        Reset
+                      />
+                      globally available by default
+                    </label>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={() => setRunnerSpecOpen(false)}>
+                        Cancel
                       </Button>
-                    </div>
+                      <Button type="submit">Save runner spec</Button>
+                    </DialogFooter>
                   </form>
+                </DialogContent>
+              </Dialog>
+            </div>
+          ) : null}
+
+          {section === "runner_groups" ? (
+            <div className="grid gap-4">
+              <Card className="min-w-0">
+                <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <CardTitle>Runner groups</CardTitle>
+                    <CardDescription>Click a group row to edit its runner specs.</CardDescription>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      onClick={() => {
+                        resetRunnerGroupForm()
+                        setRunnerGroupOpen(true)
+                      }}
+                    >
+                      <Plus />
+                      Create
+                    </Button>
+                    <Button type="button" variant="outline" size="icon" onClick={() => void loadAll()} disabled={loading} title="Refresh">
+                      <RefreshCw className={cn(loading && "animate-spin")} />
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>Name</TableHead>
+                        <TableHead>Specs</TableHead>
+                        <TableHead>Enabled</TableHead>
+                        <TableHead>Updated</TableHead>
+                        <TableHead className="w-24" />
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {runnerGroups.map((group) => (
+                        <TableRow key={group.name} className="cursor-pointer" onClick={() => loadRunnerGroupIntoForm(group)}>
+                          <TableCell>{group.name}</TableCell>
+                          <TableCell className="max-w-[420px] truncate">{group.spec_names.join(", ") || "-"}</TableCell>
+                          <TableCell>{group.enabled ? "yes" : "no"}</TableCell>
+                          <TableCell>{formatTime(group.updated_at)}</TableCell>
+                          <TableCell>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void deleteRunnerGroup(group.name)
+                              }}
+                            >
+                              <Trash2 />
+                              Delete
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
                 </CardContent>
               </Card>
+              <Dialog open={runnerGroupOpen} onOpenChange={setRunnerGroupOpen}>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{runnerGroupForm.name ? "Edit runner group" : "Create runner group"}</DialogTitle>
+                    <DialogDescription>Group runner specs so repositories can allow a named set.</DialogDescription>
+                  </DialogHeader>
+                  <form className="grid gap-3" onSubmit={saveRunnerGroup}>
+                    <Input
+                      value={runnerGroupForm.name}
+                      onChange={(event) => setRunnerGroupForm((current) => ({ ...current, name: event.target.value }))}
+                      placeholder="runner group name"
+                    />
+                    <Input
+                      value={runnerGroupForm.description}
+                      onChange={(event) => setRunnerGroupForm((current) => ({ ...current, description: event.target.value }))}
+                      placeholder="description"
+                    />
+                    <div className="grid gap-2 rounded-md border p-3">
+                      {runnerSpecs.length === 0 ? (
+                        <div className="text-sm text-muted-foreground">Create a runner spec before adding specs to a group.</div>
+                      ) : (
+                        runnerSpecs.map((runnerSpec) => (
+                          <label key={runnerSpec.name} className="flex items-center gap-2 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={runnerGroupForm.spec_names.includes(runnerSpec.name)}
+                              onChange={(event) =>
+                                setRunnerGroupForm((current) => ({
+                                  ...current,
+                                  spec_names: event.target.checked
+                                    ? [...current.spec_names, runnerSpec.name]
+                                    : current.spec_names.filter((name) => name !== runnerSpec.name),
+                                }))
+                              }
+                            />
+                            {runnerSpec.name}
+                          </label>
+                        ))
+                      )}
+                    </div>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={runnerGroupForm.enabled}
+                        onChange={(event) => setRunnerGroupForm((current) => ({ ...current, enabled: event.target.checked }))}
+                      />
+                      enabled
+                    </label>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={() => setRunnerGroupOpen(false)}>
+                        Cancel
+                      </Button>
+                      <Button type="submit">Save runner group</Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+            </div>
+          ) : null}
+
+          {section === "runner_policies" ? (
+            <div className="grid gap-4">
               <Card className="min-w-0">
-                <CardHeader>
-                  <CardTitle>Repository policies</CardTitle>
-                  <CardDescription>Click a policy row to edit it.</CardDescription>
+                <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <CardTitle>Runner policies</CardTitle>
+                    <CardDescription>Click a policy row to edit it.</CardDescription>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      onClick={() => {
+                        if (runnerSpecs.length === 0 && runnerGroups.length === 0) {
+                          toast.error("Create a runner spec or runner group before adding policies")
+                          setSection("runner_specs")
+                          return
+                        }
+                        setPolicyForm({
+                          id: 0,
+                          repository_full_name: "",
+                          target_type: runnerGroups.length > 0 ? "group" : "spec",
+                          runner_spec_name: runnerSpecs[0]?.name || "",
+                          runner_group_name: runnerGroups[0]?.name || "",
+                          enabled: true,
+                        })
+                        setRunnerPolicyOpen(true)
+                      }}
+                    >
+                      <Plus />
+                      Create
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => void loadAll()}
+                      disabled={loading}
+                      title="Refresh"
+                    >
+                      <RefreshCw className={cn(loading && "animate-spin")} />
+                    </Button>
+                  </div>
                 </CardHeader>
                 <CardContent className="p-0">
                   <Table>
                     <TableHeader>
                       <TableRow>
                         <TableHead>Repository</TableHead>
-                        <TableHead>Profile</TableHead>
+                        <TableHead>Target</TableHead>
                         <TableHead>Enabled</TableHead>
                         <TableHead>Created</TableHead>
                         <TableHead className="w-24" />
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {policies.map((policy) => (
+                      {runnerPolicies.map((policy) => (
                         <TableRow key={policy.id} className="cursor-pointer" onClick={() => loadPolicyIntoForm(policy)}>
                           <TableCell>{policy.repository_full_name}</TableCell>
-                          <TableCell>{policy.profile_name}</TableCell>
+                          <TableCell>
+                            {policy.runner_group_name
+                              ? `group:${policy.runner_group_name}`
+                              : `spec:${policy.runner_spec_name || "-"}`}
+                          </TableCell>
                           <TableCell>{policy.enabled ? "yes" : "no"}</TableCell>
                           <TableCell>{formatTime(policy.created_at)}</TableCell>
                           <TableCell>
@@ -997,6 +1433,98 @@ function App() {
                   </Table>
                 </CardContent>
               </Card>
+              <Dialog open={runnerPolicyOpen} onOpenChange={setRunnerPolicyOpen}>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>{runnerPolicyForm.id > 0 ? "Edit runner policy" : "Create runner policy"}</DialogTitle>
+                    <DialogDescription>Bind a repository pattern to an allowed runner spec or group.</DialogDescription>
+                  </DialogHeader>
+                  <form className="grid gap-3" onSubmit={savePolicy}>
+                    <Input
+                      value={runnerPolicyForm.repository_full_name}
+                      onChange={(event) =>
+                        setPolicyForm((current) => ({ ...current, repository_full_name: event.target.value }))
+                      }
+                      placeholder="owner/repo or owner/*"
+                    />
+                    <Select
+                      value={runnerPolicyForm.target_type}
+                      onValueChange={(value) =>
+                        setPolicyForm((current) => ({ ...current, target_type: value }))
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="target type" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="group">Runner group</SelectItem>
+                        <SelectItem value="spec">Runner spec</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    {runnerPolicyForm.target_type === "group" ? (
+                      runnerGroups.length === 0 ? (
+                        <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+                          Create a runner group before adding group policies.
+                        </div>
+                      ) : (
+                        <Select
+                          value={runnerPolicyForm.runner_group_name}
+                          onValueChange={(value) =>
+                            setPolicyForm((current) => ({ ...current, runner_group_name: value }))
+                          }
+                        >
+                          <SelectTrigger className="w-full">
+                            <SelectValue placeholder="runner group" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {runnerGroups.map((group) => (
+                              <SelectItem key={group.name} value={group.name}>
+                                {group.name}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      )
+                    ) : runnerSpecs.length === 0 ? (
+                      <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+                        Create a runner spec before adding runner policies.
+                      </div>
+                    ) : (
+                      <Select
+                        value={runnerPolicyForm.runner_spec_name}
+                        onValueChange={(value) =>
+                          setPolicyForm((current) => ({ ...current, runner_spec_name: value }))
+                        }
+                      >
+                        <SelectTrigger className="w-full">
+                          <SelectValue placeholder="runner spec" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {runnerSpecs.map((runnerSpec) => (
+                            <SelectItem key={runnerSpec.name} value={runnerSpec.name}>
+                              {runnerSpec.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={runnerPolicyForm.enabled}
+                        onChange={(event) => setPolicyForm((current) => ({ ...current, enabled: event.target.checked }))}
+                      />
+                      enabled
+                    </label>
+                    <DialogFooter>
+                      <Button type="button" variant="outline" onClick={() => setRunnerPolicyOpen(false)}>
+                        Cancel
+                      </Button>
+                      <Button type="submit">Save policy</Button>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
             </div>
           ) : null}
 
@@ -1005,7 +1533,7 @@ function App() {
               <Card>
                 <CardHeader>
                   <CardTitle>Label matching test</CardTitle>
-                  <CardDescription>Preview which profile a repository and label set would use.</CardDescription>
+                  <CardDescription>Preview which runner spec a repository and label set would use.</CardDescription>
                 </CardHeader>
                 <CardContent>
                   <form className="grid gap-3" onSubmit={runMatchTest}>
@@ -1026,14 +1554,14 @@ function App() {
               <Card>
                 <CardHeader>
                   <CardTitle>Match result</CardTitle>
-                  <CardDescription>Repository policy + label coverage resolution.</CardDescription>
+                  <CardDescription>Runner policy + label coverage resolution.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3">
                   {matchResult ? (
                     <>
                       <Detail label="Repository" value={matchResult.repository_full_name || "-"} />
                       <Detail label="Labels" value={matchResult.labels.join(", ") || "-"} />
-                      <Detail label="Profile" value={matchResult.profile?.name || "-"} />
+                      <Detail label="Runner spec" value={matchResult.runner_spec?.name || "-"} />
                       <Detail label="Reason" value={matchResult.reason || "matched"} />
                     </>
                   ) : (
@@ -1042,6 +1570,51 @@ function App() {
                 </CardContent>
               </Card>
             </div>
+          ) : null}
+
+          {section === "audit" ? (
+            <Card className="min-w-0">
+              <CardHeader>
+                <CardTitle>Audit events</CardTitle>
+                <CardDescription>Recent admin and recovery control-plane actions.</CardDescription>
+              </CardHeader>
+              <CardContent className="p-0">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Time</TableHead>
+                      <TableHead>Actor</TableHead>
+                      <TableHead>Action</TableHead>
+                      <TableHead>Resource</TableHead>
+                      <TableHead>Payload</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {auditEvents.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={5} className="h-24 text-center text-muted-foreground">
+                          No audit events yet
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      auditEvents.map((event) => (
+                        <TableRow key={event.id}>
+                          <TableCell>{formatTime(event.created_at)}</TableCell>
+                          <TableCell>{event.actor}</TableCell>
+                          <TableCell>{event.action}</TableCell>
+                          <TableCell>
+                            {event.resource_type} · {event.resource_id}
+                          </TableCell>
+                          <TableCell className="max-w-[420px] truncate text-xs text-muted-foreground">
+                            {event.payload_json || "-"}
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    )}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
           ) : null}
 
           {section === "diagnostics" ? (
@@ -1087,7 +1660,7 @@ function App() {
                         <div key={failure.id} className="rounded-md border p-3 text-sm">
                           <div className="font-medium">{failure.id}</div>
                           <div className="text-xs text-muted-foreground">
-                            {failure.repository_full_name || "-"} · {failure.profile_name || "-"} ·{" "}
+                            {failure.repository_full_name || "-"} · {failure.runner_spec_name || "-"} ·{" "}
                             {failure.failure_reason || failure.error || "-"}
                           </div>
                         </div>

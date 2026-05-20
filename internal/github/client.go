@@ -19,7 +19,6 @@ import (
 
 type Client struct {
 	baseURL string
-	token   string
 	scope   string
 	owner   string
 	org     string
@@ -38,7 +37,7 @@ type RegistrationToken struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-func NewClient(baseURL, token, scope, owner, org, repo string, httpClient *http.Client) *Client {
+func NewClient(baseURL, scope, owner, org, repo string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
@@ -47,7 +46,6 @@ func NewClient(baseURL, token, scope, owner, org, repo string, httpClient *http.
 	}
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   token,
 		scope:   scope,
 		owner:   owner,
 		org:     org,
@@ -74,18 +72,26 @@ func NewAppClient(baseURL, scope, owner, org, repo string, auth AppAuth, httpCli
 	}
 	cloned := *httpClient
 	cloned.Transport = transport
-	return NewClient(baseURL, "", scope, owner, org, repo, &cloned), nil
+	return NewClient(baseURL, scope, owner, org, repo, &cloned), nil
 }
 
-func (c *Client) RunnerURL() string {
+func (c *Client) RunnerURL(repositoryFullName string) (string, error) {
 	if c.scope == "org" {
-		return fmt.Sprintf("https://github.com/%s", c.org)
+		return fmt.Sprintf("https://github.com/%s", c.org), nil
 	}
-	return fmt.Sprintf("https://github.com/%s/%s", c.owner, c.repo)
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	if repositoryFullName == "" {
+		return "", fmt.Errorf("repository full name is required for repo runner scope")
+	}
+	return fmt.Sprintf("https://github.com/%s", repositoryFullName), nil
 }
 
-func (c *Client) CreateRegistrationToken(ctx context.Context) (RegistrationToken, error) {
-	url := fmt.Sprintf("%s/repos/%s/%s/actions/runners/registration-token", c.baseURL, c.owner, c.repo)
+func (c *Client) CreateRegistrationToken(ctx context.Context, repositoryFullName string) (RegistrationToken, error) {
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	if c.scope != "org" && repositoryFullName == "" {
+		return RegistrationToken{}, fmt.Errorf("repository full name is required for repo runner scope")
+	}
+	url := fmt.Sprintf("%s/repos/%s/actions/runners/registration-token", c.baseURL, repositoryFullName)
 	if c.scope == "org" {
 		url = fmt.Sprintf("%s/orgs/%s/actions/runners/registration-token", c.baseURL, c.org)
 	}
@@ -94,7 +100,6 @@ func (c *Client) CreateRegistrationToken(ctx context.Context) (RegistrationToken
 		return RegistrationToken{}, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	resp, err := c.http.Do(req)
@@ -114,6 +119,77 @@ func (c *Client) CreateRegistrationToken(ctx context.Context) (RegistrationToken
 		return RegistrationToken{}, fmt.Errorf("github registration token response missing token")
 	}
 	return token, nil
+}
+
+func (c *Client) ListWorkflowRunJobs(ctx context.Context, repositoryFullName string, runID int64) ([]WorkflowJob, error) {
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	if repositoryFullName == "" {
+		return nil, fmt.Errorf("repository full name is required")
+	}
+	url := fmt.Sprintf("%s/repos/%s/actions/runs/%d/jobs?per_page=100", c.baseURL, repositoryFullName, runID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("github workflow run jobs: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		Jobs []WorkflowJob `json:"jobs"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+	return out.Jobs, nil
+}
+
+func (c *Client) GetWorkflowJob(ctx context.Context, repositoryFullName string, jobID int64) (WorkflowJob, error) {
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	if repositoryFullName == "" {
+		return WorkflowJob{}, fmt.Errorf("repository full name is required")
+	}
+	url := fmt.Sprintf("%s/repos/%s/actions/jobs/%d", c.baseURL, repositoryFullName, jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return WorkflowJob{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return WorkflowJob{}, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return WorkflowJob{}, fmt.Errorf("github workflow job: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var job WorkflowJob
+	if err := json.Unmarshal(body, &job); err != nil {
+		return WorkflowJob{}, err
+	}
+	return job, nil
+}
+
+func (c *Client) repositoryFullName(repositoryFullName string) string {
+	repositoryFullName = strings.TrimSpace(repositoryFullName)
+	if repositoryFullName != "" {
+		return repositoryFullName
+	}
+	if c.owner != "" && c.repo != "" {
+		return fmt.Sprintf("%s/%s", c.owner, c.repo)
+	}
+	return ""
 }
 
 func VerifyWebhookSignature(secret string, body []byte, signature string) bool {
@@ -141,10 +217,17 @@ type WorkflowJobEvent struct {
 	WorkflowRun WorkflowRun `json:"workflow_run"`
 }
 
+type WorkflowRunEvent struct {
+	Action      string      `json:"action"`
+	WorkflowRun WorkflowRun `json:"workflow_run"`
+	Repository  Repository  `json:"repository"`
+}
+
 type WorkflowJob struct {
 	ID         int64  `json:"id"`
 	Name       string `json:"name"`
 	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
 	RunnerName string `json:"runner_name"`
 	Labels     Labels `json:"labels"`
 }
