@@ -29,6 +29,7 @@ type fakeSandbox struct {
 	stopErr        error
 	commandContext context.Context
 	repositoryURL  string
+	runnerGroup    string
 }
 
 func (f *fakeSandbox) StartRunner(ctx context.Context, input sandboxrunner.StartInput) (sandboxrunner.StartResult, error) {
@@ -37,6 +38,7 @@ func (f *fakeSandbox) StartRunner(ctx context.Context, input sandboxrunner.Start
 	block := f.startBlock
 	f.commandContext = input.CommandContext
 	f.repositoryURL = input.RepositoryURL
+	f.runnerGroup = input.RunnerGroup
 	f.mu.Unlock()
 	if block != nil {
 		select {
@@ -80,11 +82,26 @@ func (f *fakeSandbox) lastRepositoryURL() string {
 	return f.repositoryURL
 }
 
+func (f *fakeSandbox) lastRunnerGroup() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runnerGroup
+}
+
 func TestManualCreateAndDeleteRunner(t *testing.T) {
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners":
+			w.Write([]byte(`{"runners":[{"id":99,"name":"e2b-manual-1","status":"online"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/actions/runners/99":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ghServer.Close()
 
@@ -131,6 +148,38 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 	}
 	if fake.stoppedCount() != 1 {
 		t.Fatalf("expected second delete to be idempotent, got %d stops", fake.stoppedCount())
+	}
+}
+
+func TestOrgRunnerPassesMatchedRunnerGroupToSandbox(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/orgs/o/actions/runners/registration-token":
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+	srv.cfg.RunnerScope = "org"
+	srv.cfg.GitHubOrg = "o"
+	srv.gh = github.NewClient(ghServer.URL, "org", "", "o", "", http.DefaultClient)
+
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"org-1","repository_full_name":"o/r"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	waitForState(t, store, "org-1", state.StatusRunning)
+	if fake.lastRunnerGroup() != "default" {
+		t.Fatalf("expected runner group to be passed to sandbox, got %q", fake.lastRunnerGroup())
 	}
 }
 
@@ -1109,6 +1158,10 @@ func githubRunnerAPI(t *testing.T) http.HandlerFunc {
 		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
 			w.WriteHeader(http.StatusCreated)
 			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners":
+			w.Write([]byte(`{"runners":[]}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/repos/o/r/actions/runners/"):
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
 		}

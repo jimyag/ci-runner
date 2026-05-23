@@ -18,6 +18,7 @@ type StartInput struct {
 	RepositoryURL     string
 	RegistrationToken string
 	Labels            []string
+	RunnerGroup       string
 	TemplateID        string
 	Timeout           time.Duration
 	CommandContext    context.Context
@@ -137,5 +138,6 @@ func startScript(input StartInput) string {
 		base64.StdEncoding.EncodeToString([]byte(input.RegistrationToken)),
 		base64.StdEncoding.EncodeToString([]byte(input.RunnerName)),
 		base64.StdEncoding.EncodeToString([]byte(labels)),
+		base64.StdEncoding.EncodeToString([]byte(input.RunnerGroup)),
 	)
 }

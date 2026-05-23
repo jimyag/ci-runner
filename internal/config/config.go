@@ -25,6 +25,9 @@ type Config struct {
 	GitHubAppID             int64
 	GitHubAppInstallationID int64
 	GitHubAppPrivateKeyFile string
+	GitHubToken             string
+	GitHubBasicAuthUsername string
+	GitHubBasicAuthPassword string
 	GitHubWebhookSecret     string
 	RunnerScope             string
 	GitHubOwner             string
@@ -106,7 +109,12 @@ type fileConfig struct {
 		Owner         string `yaml:"owner"`
 		Org           string `yaml:"org"`
 		Repo          string `yaml:"repo"`
-		App           struct {
+		Token         string `yaml:"token"`
+		BasicAuth     struct {
+			Username string `yaml:"username"`
+			Password string `yaml:"password"`
+		} `yaml:"basic_auth"`
+		App struct {
 			ID             int64  `yaml:"id"`
 			InstallationID int64  `yaml:"installation_id"`
 			PrivateKeyFile string `yaml:"private_key_file"`
@@ -126,6 +134,8 @@ type fileConfig struct {
 	RunnerGroups   []RunnerGroupConfig  `yaml:"runner_groups"`
 	RunnerPolicies []RunnerPolicyConfig `yaml:"runner_policies"`
 }
+
+const defaultGitHubAPIBaseURL = "https://api.github.com"
 
 func Load(path string) (Config, error) {
 	path = strings.TrimSpace(path)
@@ -159,6 +169,9 @@ func LoadFile(path string) (Config, error) {
 		GitHubAppID:             raw.GitHub.App.ID,
 		GitHubAppInstallationID: raw.GitHub.App.InstallationID,
 		GitHubAppPrivateKeyFile: resolveConfigPath(configDir, raw.GitHub.App.PrivateKeyFile),
+		GitHubToken:             raw.GitHub.Token,
+		GitHubBasicAuthUsername: raw.GitHub.BasicAuth.Username,
+		GitHubBasicAuthPassword: raw.GitHub.BasicAuth.Password,
 		GitHubWebhookSecret:     raw.GitHub.WebhookSecret,
 		RunnerScope:             strings.ToLower(defaultString(raw.GitHub.Scope, "repo")),
 		GitHubOwner:             raw.GitHub.Owner,
@@ -177,7 +190,7 @@ func LoadFile(path string) (Config, error) {
 		RetryMaxDelay:           durationSeconds(raw.Worker.RetryMaxDelaySec, 300),
 		RetryMaxAttempts:        defaultInt(raw.Worker.RetryMaxAttempts, 5),
 		MaxConcurrentRunners:    defaultInt(raw.Worker.MaxConcurrentRunners, 100),
-		GitHubAPIBaseURL:        defaultString(raw.GitHub.APIBaseURL, "https://api.github.com"),
+		GitHubAPIBaseURL:        defaultString(raw.GitHub.APIBaseURL, defaultGitHubAPIBaseURL),
 		ConfigPath:              path,
 		RunnerSpecs:             raw.RunnerSpecs,
 		RunnerGroups:            raw.RunnerGroups,
@@ -186,10 +199,12 @@ func LoadFile(path string) (Config, error) {
 	if cfg.RunnerScope == "org" && cfg.GitHubOrg == "" {
 		cfg.GitHubOrg = cfg.GitHubOwner
 	}
-	if cfg.StateBackend == "sqlite" && strings.TrimSpace(cfg.StateDatabaseURL) == "" {
-		cfg.StateDatabaseURL = filepath.Join(".", "var", "runnerd.db")
-	}
 	if cfg.StateBackend == "sqlite" {
+		if strings.TrimSpace(cfg.StateDatabaseURL) == "" {
+			cfg.StateDatabaseURL = filepath.Join(configDir, "var", "runnerd.db")
+		} else {
+			cfg.StateDatabaseURL = resolveConfigPath(configDir, cfg.StateDatabaseURL)
+		}
 		cfg.StateDir = filepath.Dir(cfg.StateDatabaseURL)
 	}
 	if err := cfg.validate(); err != nil {
@@ -200,6 +215,12 @@ func LoadFile(path string) (Config, error) {
 }
 
 func (c Config) GitHubAuthMode() string {
+	if strings.TrimSpace(c.GitHubToken) != "" {
+		return "token"
+	}
+	if strings.TrimSpace(c.GitHubBasicAuthUsername) != "" || strings.TrimSpace(c.GitHubBasicAuthPassword) != "" {
+		return "basic"
+	}
 	return "app"
 }
 
@@ -245,23 +266,47 @@ func (c *Config) ensureDefaultSeeds() {
 func (c Config) validate() error {
 	var missing []string
 	for path, value := range map[string]string{
-		"admin.token":                 c.AdminToken,
-		"e2b.api_key":                 c.E2BAPIKey,
-		"e2b.api_url":                 c.E2BAPIURL,
-		"e2b.domain":                  c.E2BDomain,
-		"e2b.template_id":             c.SandboxTemplateID,
-		"github.webhook_secret":       c.GitHubWebhookSecret,
-		"github.app.private_key_file": c.GitHubAppPrivateKeyFile,
+		"admin.token":           c.AdminToken,
+		"e2b.api_key":           c.E2BAPIKey,
+		"e2b.api_url":           c.E2BAPIURL,
+		"e2b.domain":            c.E2BDomain,
+		"e2b.template_id":       c.SandboxTemplateID,
+		"github.webhook_secret": c.GitHubWebhookSecret,
 	} {
 		if strings.TrimSpace(value) == "" {
 			missing = append(missing, path)
 		}
 	}
-	if c.GitHubAppID == 0 {
-		missing = append(missing, "github.app.id")
+	authModes := 0
+	if c.GitHubAppID != 0 || c.GitHubAppInstallationID != 0 || strings.TrimSpace(c.GitHubAppPrivateKeyFile) != "" {
+		authModes++
+		if c.GitHubAppID == 0 {
+			missing = append(missing, "github.app.id")
+		}
+		if c.GitHubAppInstallationID == 0 {
+			missing = append(missing, "github.app.installation_id")
+		}
+		if strings.TrimSpace(c.GitHubAppPrivateKeyFile) == "" {
+			missing = append(missing, "github.app.private_key_file")
+		}
 	}
-	if c.GitHubAppInstallationID == 0 {
-		missing = append(missing, "github.app.installation_id")
+	if strings.TrimSpace(c.GitHubToken) != "" {
+		authModes++
+	}
+	if strings.TrimSpace(c.GitHubBasicAuthUsername) != "" || strings.TrimSpace(c.GitHubBasicAuthPassword) != "" {
+		authModes++
+		if strings.TrimSpace(c.GitHubBasicAuthUsername) == "" {
+			missing = append(missing, "github.basic_auth.username")
+		}
+		if strings.TrimSpace(c.GitHubBasicAuthPassword) == "" {
+			missing = append(missing, "github.basic_auth.password")
+		}
+	}
+	if authModes == 0 {
+		missing = append(missing, "github.app or github.token or github.basic_auth")
+	}
+	if authModes > 1 {
+		return fmt.Errorf("invalid config github auth: configure exactly one of app, token, or basic_auth")
 	}
 	switch c.RunnerScope {
 	case "repo":
@@ -274,6 +319,9 @@ func (c Config) validate() error {
 	}
 	if c.StateBackend != "sqlite" && c.StateBackend != "postgres" {
 		return fmt.Errorf("invalid config database.backend: must be sqlite or postgres")
+	}
+	if strings.TrimRight(c.GitHubAPIBaseURL, "/") != defaultGitHubAPIBaseURL {
+		return fmt.Errorf("invalid config github.api_base_url: only %s is supported", defaultGitHubAPIBaseURL)
 	}
 	if strings.TrimSpace(c.StateDatabaseURL) == "" {
 		missing = append(missing, "database.url")

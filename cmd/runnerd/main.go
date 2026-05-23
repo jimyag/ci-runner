@@ -40,13 +40,24 @@ func main() {
 	}
 	githubHTTPClient := &http.Client{Timeout: 30 * time.Second}
 	sandboxHTTPClient := &http.Client{}
-	gh, err := github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
-		AppID:          cfg.GitHubAppID,
-		InstallationID: cfg.GitHubAppInstallationID,
-		PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
-	}, githubHTTPClient)
-	if err != nil {
-		logger.Error("create github app client", "error", err)
+	var gh *github.Client
+	switch cfg.GitHubAuthMode() {
+	case "app":
+		gh, err = github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
+			AppID:          cfg.GitHubAppID,
+			InstallationID: cfg.GitHubAppInstallationID,
+			PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
+		}, githubHTTPClient)
+		if err != nil {
+			logger.Error("create github app client", "error", err)
+			os.Exit(1)
+		}
+	case "token":
+		gh = github.NewTokenClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, cfg.GitHubToken, githubHTTPClient)
+	case "basic":
+		gh = github.NewBasicAuthClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, cfg.GitHubBasicAuthUsername, cfg.GitHubBasicAuthPassword, githubHTTPClient)
+	default:
+		logger.Error("unsupported github auth mode", "mode", cfg.GitHubAuthMode())
 		os.Exit(1)
 	}
 	sb, err := sandboxrunner.NewE2BService(cfg.E2BAPIKey, cfg.E2BAPIURL, sandboxHTTPClient)

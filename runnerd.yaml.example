@@ -6,6 +6,7 @@ server:
 
 database:
   backend: sqlite
+  # Relative sqlite paths are resolved from the directory containing runnerd.yaml.
   url: ./var/runnerd.db
 
 admin:
@@ -23,7 +24,7 @@ e2b:
 
 github:
   webhook_secret: change-me
-  api_base_url: https://api.github.com
+  # GitHub.com only. GitHub Enterprise Server is not currently supported.
   scope: repo
   # owner/repo are optional defaults for manual requests only.
   # Webhook requests use repository.full_name from GitHub and are admitted by runner_policies.
@@ -34,6 +35,11 @@ github:
     installation_id: 12345678
     # Relative paths are resolved from the directory containing runnerd.yaml.
     private_key_file: ./secrets/github-app.pem
+  # Auth alternatives: configure exactly one of app, token, or basic_auth.
+  # token: ghp_your-token
+  # basic_auth:
+  #   username: your-username
+  #   password: your-token-or-password
 
 worker:
   runner_labels:
@@ -59,6 +65,7 @@ runner_specs:
 
 runner_groups:
   - name: default
+    # For org runners, this name is passed to GitHub as --runnergroup.
     description: Default runner specs for installed repositories.
     spec_names: [default]
     enabled: true

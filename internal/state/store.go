@@ -1350,14 +1350,7 @@ func (s *DBStore) recordToRunnerGroup(db *gorm.DB, record runnerGroupRecord) (Ru
 }
 
 func recordToRepositoryPolicy(record repositoryPolicyRecord) RepositoryPolicy {
-	return RepositoryPolicy{
-		ID:                 record.ID,
-		RepositoryFullName: record.RepositoryFullName,
-		ProfileName:        record.ProfileName,
-		RunnerGroupName:    record.RunnerGroupName,
-		Enabled:            record.Enabled,
-		CreatedAt:          record.CreatedAt,
-	}
+	return RepositoryPolicy(record)
 }
 
 func uniqueTrimmed(values []string) []string {

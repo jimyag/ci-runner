@@ -14,10 +14,8 @@ RUN CGO_ENABLED=0 go build \
 
 FROM gcr.io/distroless/static:nonroot
 
-ENV HTTP_ADDR=:25500 \
-    STATE_DIR=/tmp/e2b-github-runner/runners
-
 COPY --from=builder /out/runnerd /usr/local/bin/runnerd
 
 EXPOSE 25500
 ENTRYPOINT ["/usr/local/bin/runnerd"]
+CMD ["--config", "/etc/runnerd/runnerd.yaml"]

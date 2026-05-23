@@ -482,7 +482,13 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		metrics.RecordWorkflowCompleted(st.RepositoryFullName, event.WorkflowRun.Name, event.WorkflowJob.Name, st.ProfileName, "completed")
+		conclusion := workflowConclusion(event.WorkflowJob)
+		jobName := workflowJobName(st, event.WorkflowJob)
+		metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowNameOrUnknown(event.WorkflowRun.Name), jobName, st.ProfileName, conclusion)
+		s.recordWorkflowRunDuration(st, event.WorkflowRun.Name, jobName, conclusion)
+		if isFailureConclusion(conclusion) {
+			metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowNameOrUnknown(event.WorkflowRun.Name), jobName, st.ProfileName, "workflow_job", conclusion)
+		}
 		s.logger.Info("workflow_job completed handled", "job_id", id, "request_id", stopID, "repository", st.RepositoryFullName, "status", st.Status, "matched_by", reason)
 		writeJSON(w, http.StatusAccepted, st)
 	default:
@@ -503,6 +509,73 @@ func (s *Server) completedWorkflowJobStopID(job github.WorkflowJob) (string, str
 		return id, "workflow_job_id"
 	}
 	return "", ""
+}
+
+func workflowConclusion(job github.WorkflowJob) string {
+	if strings.TrimSpace(job.Conclusion) != "" {
+		return strings.TrimSpace(job.Conclusion)
+	}
+	if strings.TrimSpace(job.Status) != "" {
+		return strings.TrimSpace(job.Status)
+	}
+	return "unknown"
+}
+
+func workflowNameOrUnknown(workflow string) string {
+	workflow = strings.TrimSpace(workflow)
+	if workflow == "" {
+		return "unknown"
+	}
+	return workflow
+}
+
+func workflowJobName(st state.RunnerState, job github.WorkflowJob) string {
+	if strings.TrimSpace(job.Name) != "" {
+		return strings.TrimSpace(job.Name)
+	}
+	if st.AssignedJobName != "" && st.AssignedJobName != runnerJobStartedMarker {
+		return st.AssignedJobName
+	}
+	if st.RunnerName != "" {
+		return st.RunnerName
+	}
+	return "unknown"
+}
+
+func isFailureConclusion(conclusion string) bool {
+	switch strings.ToLower(strings.TrimSpace(conclusion)) {
+	case "", "success", "completed":
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) recordWorkflowQueueDuration(st state.RunnerState, workflow, job string) {
+	start := st.CreatedAt
+	if start.IsZero() {
+		return
+	}
+	end := st.RunningAt
+	if end.IsZero() {
+		end = time.Now().UTC()
+	}
+	metrics.RecordWorkflowQueueDuration(st.RepositoryFullName, workflowNameOrUnknown(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, end.Sub(start))
+}
+
+func (s *Server) recordWorkflowRunDuration(st state.RunnerState, workflow, job, conclusion string) {
+	start := st.RunningAt
+	end := st.CompletedAt
+	if end.IsZero() && st.Status == state.StatusFailed {
+		end = st.FailedAt
+		if end.IsZero() {
+			end = time.Now().UTC()
+		}
+	}
+	if start.IsZero() || end.IsZero() {
+		return
+	}
+	metrics.RecordWorkflowRunDuration(st.RepositoryFullName, workflowNameOrUnknown(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, conclusion, end.Sub(start))
 }
 
 func (s *Server) handleWorkflowRunWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -1290,6 +1363,7 @@ func (s *Server) rejectAdmission(req state.RunnerRequest, payload []byte, reason
 	}
 	s.store.AppendLog(req.ID, "control.log", []byte("runner admission rejected: "+reason+"\n"))
 	s.logger.Info("runner admission rejected and recorded", "id", req.ID, "repository", req.RepositoryFullName, "reason", reason)
+	metrics.RecordWorkflowFailure(req.RepositoryFullName, "unknown", req.RunnerName, req.ProfileName, "admission", reason)
 	s.refreshMetrics()
 	return st, nil
 }
@@ -1385,6 +1459,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		RepositoryURL:     repositoryURL,
 		RegistrationToken: token.Token,
 		Labels:            req.Labels,
+		RunnerGroup:       s.githubRunnerGroup(req.RunnerGroup),
 		TemplateID:        profile.TemplateID,
 		Timeout:           s.cfg.SandboxTimeout,
 		CommandContext:    ctx,
@@ -1433,7 +1508,9 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	s.logger.Info("sandbox runner started", "id", id, "sandbox_id", result.SandboxID, "pid", result.PID)
 	s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("sandbox runner started sandbox_id=%s pid=%d\n", result.SandboxID, result.PID)))
 	metrics.RecordCreate(req.ProfileName, time.Since(createStartedAt), "success")
-	metrics.RecordWorkflowStarted(req.RepositoryFullName, "", req.RunnerName, req.ProfileName)
+	metrics.RecordRunnerRegistered(req.ProfileName, "success")
+	metrics.RecordWorkflowStarted(req.RepositoryFullName, "unknown", req.RunnerName, req.ProfileName)
+	s.recordWorkflowQueueDuration(st, "", req.RunnerName)
 	s.refreshMetrics()
 	<-exitCh
 }
@@ -1493,6 +1570,12 @@ func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reaso
 	}
 	s.logger.Info("runner skipped before sandbox start", "id", id, "job_id", job.ID, "job_status", job.Status, "job_conclusion", job.Conclusion, "reason", reason)
 	s.store.AppendLog(id, "control.log", []byte("runner skipped before sandbox start: "+reason+"\n"))
+	conclusion := workflowConclusion(job)
+	jobName := workflowJobName(st, job)
+	metrics.RecordWorkflowCompleted(st.RepositoryFullName, "unknown", jobName, st.ProfileName, conclusion)
+	if isFailureConclusion(conclusion) {
+		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", jobName, st.ProfileName, "workflow_job", conclusion)
+	}
 	s.refreshMetrics()
 }
 
@@ -1502,8 +1585,11 @@ func (s *Server) appendRunnerStdout(id string, data []byte) {
 	if strings.Contains(text, "Listening for Jobs") {
 		s.logger.Info("runner is listening for jobs", "id", id)
 	}
-	if strings.Contains(text, "Running job:") {
+	if strings.Contains(text, "Running job:") || strings.Contains(text, "RUNNERD_JOB_STARTED") {
 		s.markRunnerJobStarted(id)
+	}
+	if strings.Contains(text, "RUNNERD_JOB_COMPLETED") {
+		s.store.AppendLog(id, "control.log", []byte("runner completed job hook received\n"))
 	}
 }
 
@@ -1548,6 +1634,9 @@ func (s *Server) failStart(id string, st state.RunnerState, stage string, err er
 		s.logger.Error("write failed state", "id", id, "error", writeErr)
 	}
 	metrics.RecordCreate(st.ProfileName, 0, result.metricResult)
+	if result.metricResult == "failed" {
+		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
+	}
 	if st.Status == state.StatusQueued {
 		s.signalQueue()
 	}
@@ -1569,11 +1658,16 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 	if err != nil {
 		st.Status = state.StatusFailed
 		st.Error = err.Error()
+		st.FailureStage = "runner_exit"
+		st.FailureReason = "process_error"
 		s.logger.Error("runner process exited with error", "id", id, "error", err)
 		s.store.AppendLog(id, "control.log", []byte("runner process exited with error: "+err.Error()+"\n"))
 		if cleanupErr := s.cleanupSandboxAfterExit(id, st); cleanupErr != nil {
 			st.Error = st.Error + "; cleanup sandbox: " + cleanupErr.Error()
 		}
+		s.cleanupGitHubRunner(context.Background(), st)
+		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
+		s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), "failure")
 		s.writeStateOrLog(id, st, "write failed exit state")
 		return
 	}
@@ -1583,6 +1677,8 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 	} else {
 		st.Status = state.StatusFailed
 		st.Error = runnerExitMessage(result)
+		st.FailureStage = "runner_exit"
+		st.FailureReason = strconv.Itoa(result.ExitCode)
 		s.logger.Error("runner process exited non-zero", "id", id, "exit_code", result.ExitCode, "stderr", result.Stderr, "runner_error", result.Error)
 		s.store.AppendLog(id, "control.log", []byte(st.Error+"\n"))
 	}
@@ -1593,6 +1689,13 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 		st.Status = state.StatusCompleted
 		st.CompletedAt = time.Now().UTC()
 	}
+	s.cleanupGitHubRunner(context.Background(), st)
+	conclusion := "success"
+	if st.Status == state.StatusFailed {
+		conclusion = "failure"
+		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
+	}
+	s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), conclusion)
 	s.writeStateOrLog(id, st, "write exited state")
 	s.refreshMetrics()
 }
@@ -1644,6 +1747,7 @@ func (s *Server) recoverRunner(ctx context.Context, id string) error {
 			}
 		}
 	}
+	s.cleanupGitHubRunner(ctx, st)
 	st.Status = state.StatusFailed
 	st.FailureStage = "recovery"
 	st.FailureReason = "interrupted_runner"
@@ -1730,11 +1834,14 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 				}
 				s.logger.Error("runner stop failed", "id", id, "sandbox_id", st.SandboxID, "error", err)
 				metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "failed")
+				metrics.RecordRunnerCleanup(st.ProfileName, "failed")
+				metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, job), st.ProfileName, st.FailureStage, st.FailureReason)
 				s.refreshMetrics()
 				return st, err
 			}
 		}
 	}
+	s.cleanupGitHubRunner(ctx, st)
 	st.Status = state.StatusCompleted
 	st.CompletedAt = time.Now().UTC()
 	st.Error = ""
@@ -1743,8 +1850,39 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 	}
 	s.logger.Info("runner stopped", "id", id, "sandbox_id", st.SandboxID, "duration_ms", time.Since(stopStartedAt).Milliseconds())
 	metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
+	s.recordWorkflowRunDuration(st, "", workflowJobName(st, job), workflowConclusion(job))
 	s.refreshMetrics()
 	return st, nil
+}
+
+func (s *Server) githubRunnerGroup(group string) string {
+	if s.cfg.RunnerScope != "org" {
+		return ""
+	}
+	return strings.TrimSpace(group)
+}
+
+func (s *Server) cleanupGitHubRunner(ctx context.Context, st state.RunnerState) {
+	if strings.TrimSpace(st.RunnerName) == "" {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	removed, err := s.gh.RemoveRunnerByName(cleanupCtx, st.RepositoryFullName, st.RunnerName)
+	if err != nil {
+		s.logger.Warn("github runner cleanup failed", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName, "error", err)
+		s.store.AppendLog(st.ID, "control.log", []byte("github runner cleanup failed: "+err.Error()+"\n"))
+		metrics.RecordRunnerCleanup(st.ProfileName, "error")
+		return
+	}
+	if removed {
+		s.logger.Info("github runner registration removed", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName)
+		s.store.AppendLog(st.ID, "control.log", []byte("github runner registration removed\n"))
+		metrics.RecordRunnerCleanup(st.ProfileName, "removed")
+		return
+	}
+	s.logger.Info("github runner registration already absent", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName)
+	metrics.RecordRunnerCleanup(st.ProfileName, "absent")
 }
 
 func (s *Server) writeStateOrLog(id string, st state.RunnerState, msg string) {

@@ -28,9 +28,40 @@ runner_url="$(printf '%%s' "%[1]s" | base64 -d)"
 registration_token="$(printf '%%s' "%[2]s" | base64 -d)"
 runner_name="$(printf '%%s' "%[3]s" | base64 -d)"
 runner_labels="$(printf '%%s' "%[4]s" | base64 -d)"
+runner_group="$(printf '%%s' "%[5]s" | base64 -d)"
+
+mkdir -p /tmp/runnerd-hooks
+cat >/tmp/runnerd-hooks/job-started.sh <<'HOOK'
+#!/usr/bin/env bash
+echo "RUNNERD_JOB_STARTED"
+HOOK
+cat >/tmp/runnerd-hooks/job-completed.sh <<'HOOK'
+#!/usr/bin/env bash
+echo "RUNNERD_JOB_COMPLETED"
+HOOK
+chmod +x /tmp/runnerd-hooks/job-started.sh /tmp/runnerd-hooks/job-completed.sh
+export ACTIONS_RUNNER_HOOK_JOB_STARTED=/tmp/runnerd-hooks/job-started.sh
+export ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/tmp/runnerd-hooks/job-completed.sh
+
+config_args=(--url "$runner_url" --token "$registration_token" --name "$runner_name" --labels "$runner_labels" --ephemeral --unattended --replace --disableupdate)
+if [ -n "$runner_group" ]; then
+  config_args+=(--runnergroup "$runner_group")
+fi
 
 echo "configuring GitHub Actions runner ${runner_name}"
-./config.sh --url "$runner_url" --token "$registration_token" --name "$runner_name" --labels "$runner_labels" --ephemeral --unattended --replace --disableupdate
+retries_left=10
+while [ "$retries_left" -gt 0 ]; do
+  if ./config.sh "${config_args[@]}"; then
+    break
+  fi
+  retries_left=$((retries_left - 1))
+  if [ "$retries_left" -eq 0 ]; then
+    echo "GitHub Actions runner configuration failed" >&2
+    exit 2
+  fi
+  echo "GitHub Actions runner configuration failed, retrying"
+  sleep 1
+done
 cleanup() {
   ./config.sh remove --token "$registration_token" || true
 }

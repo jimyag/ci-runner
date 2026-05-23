@@ -12,6 +12,7 @@ func TestStartScriptEncodesRunnerArguments(t *testing.T) {
 		RegistrationToken: `tok"$(touch /tmp/token)"`,
 		RunnerName:        "runner`touch /tmp/name`",
 		Labels:            []string{"self-hosted", `e2b$(touch /tmp/label)`},
+		RunnerGroup:       `group$(touch /tmp/group)`,
 	}
 	script := startScript(input)
 
@@ -20,6 +21,7 @@ func TestStartScriptEncodesRunnerArguments(t *testing.T) {
 		input.RegistrationToken,
 		input.RunnerName,
 		strings.Join(input.Labels, ","),
+		input.RunnerGroup,
 	} {
 		if strings.Contains(script, raw) {
 			t.Fatalf("script contains raw argument %q:\n%s", raw, script)

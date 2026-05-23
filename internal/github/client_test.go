@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -14,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/bradleyfalzon/ghinstallation/v2"
 )
@@ -50,13 +52,15 @@ func TestLabelsUnmarshalAndMatch(t *testing.T) {
 }
 
 func TestCreateRegistrationToken(t *testing.T) {
+	var requests int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
 		if r.URL.Path != "/repos/o/r/actions/runners/registration-token" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+		w.Write([]byte(`{"token":"runner-token","expires_at":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
 	}))
 	defer ts.Close()
 
@@ -67,6 +71,13 @@ func TestCreateRegistrationToken(t *testing.T) {
 	}
 	if token.Token != "runner-token" {
 		t.Fatalf("unexpected token: %q", token.Token)
+	}
+	token, err = client.CreateRegistrationToken(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 {
+		t.Fatalf("expected cached token to avoid second request, got %d requests", requests)
 	}
 }
 
@@ -146,6 +157,69 @@ func TestCreateOrgRegistrationToken(t *testing.T) {
 	}
 	if got, err := client.RunnerURL("ignored/repo"); err != nil || got != "https://github.com/my-org" {
 		t.Fatalf("unexpected runner url: %s", got)
+	}
+}
+
+func TestTokenAndBasicAuthClientsSetAuthorizationHeader(t *testing.T) {
+	var gotTokenAuth string
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTokenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+	}))
+	defer tokenServer.Close()
+
+	tokenClient := NewTokenClient(tokenServer.URL, "repo", "o", "", "r", "ghp_test", tokenServer.Client())
+	if _, err := tokenClient.CreateRegistrationToken(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if gotTokenAuth != "Bearer ghp_test" {
+		t.Fatalf("unexpected token auth header: %q", gotTokenAuth)
+	}
+
+	var gotBasicAuth string
+	basicServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotBasicAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+	}))
+	defer basicServer.Close()
+
+	basicClient := NewBasicAuthClient(basicServer.URL, "repo", "o", "", "r", "octo", "secret", basicServer.Client())
+	if _, err := basicClient.CreateRegistrationToken(t.Context(), ""); err != nil {
+		t.Fatal(err)
+	}
+	wantBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte("octo:secret"))
+	if gotBasicAuth != wantBasic {
+		t.Fatalf("unexpected basic auth header: %q", gotBasicAuth)
+	}
+}
+
+func TestListAndRemoveRunnerByName(t *testing.T) {
+	var deleted bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners":
+			w.Write([]byte(`{"runners":[{"id":42,"name":"e2b-1001","status":"offline","busy":false}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/actions/runners/42":
+			deleted = true
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
+	removed, err := client.RemoveRunnerByName(t.Context(), "o/r", "e2b-1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !removed || !deleted {
+		t.Fatalf("expected runner to be removed, removed=%v deleted=%v", removed, deleted)
 	}
 }
 

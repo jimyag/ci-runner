@@ -15,7 +15,7 @@ server:
   http_addr: ":28000"
 database:
   backend: sqlite
-  url: `+filepath.Join(dir, "runnerd.db")+`
+  url: ./runnerd.db
 admin:
   token: admin-token
 e2b:
@@ -25,7 +25,6 @@ e2b:
   template_id: base
 github:
   webhook_secret: webhook-secret
-  api_base_url: https://api.github.example
   scope: repo
   app:
     id: 123
@@ -67,6 +66,9 @@ runner_policies:
 	if cfg.GitHubAuthMode() != "app" {
 		t.Fatalf("unexpected auth mode: %s", cfg.GitHubAuthMode())
 	}
+	if cfg.GitHubAPIBaseURL != defaultGitHubAPIBaseURL {
+		t.Fatalf("unexpected GitHub API base URL: %s", cfg.GitHubAPIBaseURL)
+	}
 	if cfg.GitHubAppPrivateKeyFile != filepath.Join(dir, "secrets", "app.pem") {
 		t.Fatalf("unexpected private key path: %s", cfg.GitHubAppPrivateKeyFile)
 	}
@@ -84,7 +86,112 @@ runner_policies:
 	}
 }
 
-func TestLoadFileRequiresGitHubAppConfigPaths(t *testing.T) {
+func TestLoadFileRejectsUnsupportedGitHubAPIBaseURL(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+  domain: example.e2b.dev
+  template_id: base
+github:
+  webhook_secret: webhook-secret
+  api_base_url: https://github.example/api/v3
+  scope: repo
+  app:
+    id: 123
+    installation_id: 456
+    private_key_file: ./secrets/app.pem
+worker:
+  runner_labels: [self-hosted, e2b]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "github.api_base_url") {
+		t.Fatalf("expected error to mention github.api_base_url, got %v", err)
+	}
+}
+
+func TestLoadFileSupportsGitHubTokenAuth(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+  domain: example.e2b.dev
+  template_id: base
+github:
+  webhook_secret: webhook-secret
+  scope: repo
+  token: ghp_test
+worker:
+  runner_labels: [self-hosted, e2b]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHubAuthMode() != "token" || cfg.GitHubToken != "ghp_test" {
+		t.Fatalf("unexpected token auth config: mode=%s token=%q", cfg.GitHubAuthMode(), cfg.GitHubToken)
+	}
+}
+
+func TestLoadFileSupportsGitHubBasicAuth(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+  domain: example.e2b.dev
+  template_id: base
+github:
+  webhook_secret: webhook-secret
+  scope: repo
+  basic_auth:
+    username: octo
+    password: secret
+worker:
+  runner_labels: [self-hosted, e2b]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHubAuthMode() != "basic" || cfg.GitHubBasicAuthUsername != "octo" || cfg.GitHubBasicAuthPassword != "secret" {
+		t.Fatalf("unexpected basic auth config: %#v", cfg)
+	}
+}
+
+func TestLoadFileRejectsMissingGitHubAuth(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "runnerd.yaml")
 	if err := os.WriteFile(configPath, []byte(`
@@ -111,9 +218,44 @@ worker:
 	if err == nil {
 		t.Fatal("expected validation error")
 	}
-	for _, want := range []string{"github.app.id", "github.app.installation_id", "github.app.private_key_file"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("expected error to mention %s, got %v", want, err)
-		}
+	if !strings.Contains(err.Error(), "github.app or github.token or github.basic_auth") {
+		t.Fatalf("expected missing auth error, got %v", err)
+	}
+}
+
+func TestLoadFileRejectsMultipleGitHubAuthModes(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+  domain: example.e2b.dev
+  template_id: base
+github:
+  webhook_secret: webhook-secret
+  scope: repo
+  token: ghp_test
+  app:
+    id: 123
+    installation_id: 456
+    private_key_file: ./secrets/app.pem
+worker:
+  runner_labels: [self-hosted, e2b]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected multiple auth error, got %v", err)
 	}
 }

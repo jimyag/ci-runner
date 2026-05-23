@@ -2,10 +2,8 @@ FROM gcr.io/distroless/static:nonroot
 
 ARG TARGETARCH
 
-ENV HTTP_ADDR=:25500 \
-    STATE_DIR=/tmp/e2b-github-runner/runners
-
 COPY linux/${TARGETARCH}/runnerd /usr/local/bin/runnerd
 
 EXPOSE 25500
 ENTRYPOINT ["/usr/local/bin/runnerd"]
+CMD ["--config", "/etc/runnerd/runnerd.yaml"]
