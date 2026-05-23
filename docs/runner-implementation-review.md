@@ -182,13 +182,21 @@ Recommendation:
 - Record profile/policy create/patch/delete, runner retry/stop, config reload, and recovery cleanup.
 - Expose `GET /audit-events` in admin.
 
-### P2: Metrics And Diagnostics Are Partial
+### P2: Metrics And Diagnostics Coverage
 
-The project intentionally uses `github.com/jimmicro/pprof` and `expvar`, not Prometheus. That difference is acceptable because it follows the current user requirement. The issue is coverage and freshness:
+The project intentionally uses `github.com/jimmicro/pprof` and `expvar`, not Prometheus. That difference is acceptable because it follows the current user requirement. The implementation now covers the main ARC and Fireactions signal families through expvar:
 
-- `internal/metrics/metrics.go:11-22` exposes basic expvar maps only.
-- `internal/metrics/metrics.go:55-63` records duration totals without counts or buckets.
-- `internal/metrics/metrics.go:65-75` tracks workflow counts, but not queue duration, run duration, failure stage, retry count, or E2B error class.
+- Profile gauges: current, busy, idle, desired, pending, enabled status.
+- Request gauges: profile/status, repository/status, retry state, worker leases.
+- Runner operation metrics: create/stop duration totals and counts, generic operation totals.
+- GitHub operation metrics: API operation totals and duration totals.
+- Runner lifecycle metrics: registration and cleanup counters.
+- Workflow job metrics: queued/started/completed counters, conclusions, failures, queue duration totals/counts, run duration totals/counts.
+
+Remaining differences:
+
+- expvar exposes cumulative totals and counts, not Prometheus histogram buckets.
+- Workflow names can be `unknown` on paths where GitHub only provides runner state, because workflow name is not persisted in `RunnerState`.
 - Metrics are refreshed only when selected endpoints or state transitions call `refreshMetrics`.
 - `internal/server/server.go:695-710` diagnostics hardcode DB assumptions in the response path and do not fully reflect a configurable DB backend.
 
@@ -199,11 +207,8 @@ Comparison:
 
 Recommendation:
 
-- Keep jimmicro/pprof, but add expvar counters/gauges for:
-  - queued/running/completed/failed by profile and repository.
-  - create/stop attempts, successes, failures, retries.
-  - queue duration and run duration as count/sum/min/max.
-  - last reconcile time and worker lease counts.
+- Keep jimmicro/pprof and expvar unless a Prometheus endpoint becomes a deployment requirement.
+- If richer latency analysis is needed, add histogram buckets or export expvar to Prometheus in a separate adapter.
 - Refresh gauges periodically from the reconciler, not only through API reads.
 
 ### P2: Admin UI Does Not Cover The Full Control Plane

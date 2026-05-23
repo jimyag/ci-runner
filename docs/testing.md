@@ -11,6 +11,8 @@ cp runnerd.yaml.example runnerd.yaml
 mkdir -p ./secrets
 ```
 
+相对 sqlite `database.url` 和 `github.app.private_key_file` 都相对 `runnerd.yaml` 所在目录解析。当前只支持 GitHub.com，不支持 GitHub Enterprise Server。GitHub 鉴权可以使用 GitHub App、PAT token 或 basic auth，但只能三选一。
+
 最小可用配置示例：
 
 ```yaml
@@ -67,9 +69,9 @@ runner_policies:
 
 组织级 runner 只要把 `github.scope` 改成 `org`，并填写 `github.org`。
 
-## 2. 创建 GitHub App 的完整流程
+## 2. 配置 GitHub 鉴权
 
-不再使用 PAT；runnerd 只支持 GitHub App 鉴权。
+推荐使用 GitHub App。PAT token 和 basic auth 也支持，主要用于本地验证或已有凭据场景。
 
 GitHub App 需要能调用对应 scope 的 runner registration token API。Repository runner 需要目标仓库的 administration 权限；organization runner 需要组织级 self-hosted runner 管理权限。
 
@@ -107,7 +109,27 @@ github:
     private_key_file: ./secrets/github-app.pem
 ```
 
-repo scope 下不需要固定 `owner/repo`；webhook 会使用 payload 里的 `repository.full_name` 创建对应 repository runner。`runner_specs.default_available: true` 的规格对所有仓库默认可用；`runner_policies` 只需要用于给某个仓库或仓库通配符追加特殊 spec，例如 `jimyag/*` 或 `jimyag/template-repository`。如果是 organization runner，把 `scope` 改成 `org`，并填写 `org`。
+PAT 示例：
+
+```yaml
+github:
+  webhook_secret: <random webhook secret>
+  scope: repo
+  token: <github token>
+```
+
+Basic auth 示例：
+
+```yaml
+github:
+  webhook_secret: <random webhook secret>
+  scope: repo
+  basic_auth:
+    username: <github username>
+    password: <token or password>
+```
+
+repo scope 下不需要固定 `owner/repo`；webhook 会使用 payload 里的 `repository.full_name` 创建对应 repository runner。`runner_specs.default_available: true` 的规格对所有仓库默认可用；`runner_policies` 只需要用于给某个仓库或仓库通配符追加特殊 spec，例如 `jimyag/*` 或 `jimyag/template-repository`。如果是 organization runner，把 `scope` 改成 `org`，并填写 `org`。org scope 下匹配到的 `runner_group` 会作为 GitHub runner registration 的 `--runnergroup` 传入。
 
 ## 3. 启动服务
 
@@ -337,11 +359,11 @@ curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/diagn
 - 发现到的 pprof 地址文件
 - dump 脚本路径
 - 当前 DB 路径
-- GitHub 鉴权模式（app）
+- GitHub 鉴权模式（app、token 或 basic）
 - sandbox API 配置摘要
 - 最近失败的 runner request
 
-`/diagnostics/vars` 会代理本地 pprof 服务的 `GET /debug/vars`，可以直接看到 expvar 指标摘要。
+`/diagnostics/vars` 会代理本地 pprof 服务的 `GET /debug/vars`，可以直接看到 expvar 指标摘要。当前指标覆盖 profile current/busy/idle/pending/desired、retry/lease、create/stop 次数与耗时、GitHub API 调用、runner 注册/清理，以及 workflow job queued/started/completed、conclusion、failure、queue duration 和 run duration。
 
 ## 11. 官方参考
 
