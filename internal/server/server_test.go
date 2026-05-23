@@ -494,6 +494,48 @@ func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
 	}
 }
 
+func TestWebhookInProgressRecordsAssignedJob(t *testing.T) {
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, "http://example.test", fake)
+
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "1001",
+		Source:             "test",
+		JobID:              2002,
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-1001",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusRunning
+	st.RunningAt = time.Now().UTC()
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte(`{"action":"in_progress","repository":{"full_name":"o/r"},"workflow_job":{"id":2002,"name":"staticcheck","runner_name":"e2b-1001","workflow_name":"ci","labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected in_progress status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	st, err = store.ReadState("1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.AssignedJobID != 2002 || st.AssignedJobName != "staticcheck" {
+		t.Fatalf("expected assigned job from in_progress event, got id=%d name=%q", st.AssignedJobID, st.AssignedJobName)
+	}
+}
+
 func TestWebhookCompletedIsIdempotent(t *testing.T) {
 	ghServer := httptest.NewServer(githubRunnerAPI(t))
 	defer ghServer.Close()

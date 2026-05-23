@@ -248,7 +248,7 @@ Settings -> Webhooks -> Add webhook
 - Which events：选择 `Workflow jobs`。如果希望开启补偿路径，也可以同时选择 `Workflow runs`。
 - Active：勾选。
 
-保存后，GitHub 会发送一次 ping。当前服务处理 `workflow_job` 作为主路径，也处理 `workflow_run.requested` / `workflow_run.in_progress` 作为补偿路径；其他事件会返回 ignored，这是正常的。
+保存后，GitHub 会发送一次 ping。当前服务处理 `workflow_job.queued` / `workflow_job.in_progress` / `workflow_job.completed` 作为主路径，也处理 `workflow_run.requested` / `workflow_run.in_progress` 作为补偿路径；其他事件会返回 ignored，这是正常的。
 
 ## 7. 配置 GitHub Actions Workflow
 

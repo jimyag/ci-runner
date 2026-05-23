@@ -76,4 +76,4 @@ task docker-check
 task release-check
 ```
 
-Use `runs-on: [self-hosted, e2b]` in the target workflow. Configure a GitHub webhook for `workflow_job` events pointing at `POST /webhooks/github`. You can also include `workflow_run` events as a compensating signal; runnerd lists all queued jobs in the run and enqueues any matching jobs not already seen from `workflow_job`.
+Use `runs-on: [self-hosted, e2b]` in the target workflow. Configure a GitHub webhook for `workflow_job` events pointing at `POST /webhooks/github`; runnerd handles `queued`, `in_progress`, and `completed` actions. You can also include `workflow_run` events as a compensating signal; runnerd lists all queued jobs in the run and enqueues any matching jobs not already seen from `workflow_job`.

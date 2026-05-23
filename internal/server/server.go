@@ -467,8 +467,28 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		req.RunnerGroup = match.Profile.RunnerGroup
 		req.Labels = append([]string(nil), match.Profile.Labels...)
 		s.logger.Info("workflow_job matched profile", "job_id", id, "repository", event.Repository.FullName, "profile", match.Profile.Name, "runner_group", match.Profile.RunnerGroup, "labels", req.Labels)
-		metrics.RecordWorkflowQueued(event.Repository.FullName, event.WorkflowRun.Name, event.WorkflowJob.Name, match.Profile.Name)
+		workflowName := workflowNameFor(event.WorkflowJob.WorkflowName, event.WorkflowRun.Name)
+		metrics.RecordWorkflowQueued(event.Repository.FullName, workflowName, event.WorkflowJob.Name, match.Profile.Name)
 		s.createAndStart(w, r, req, body)
+	case "in_progress":
+		startID, reason := s.completedWorkflowJobStopID(event.WorkflowJob)
+		if startID == "" {
+			s.logger.Info("in_progress workflow job has no managed runner", "job_id", id, "runner_name", event.WorkflowJob.RunnerName)
+			writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
+			return
+		}
+		st, err := s.markWorkflowJobInProgress(startID, event.WorkflowJob)
+		if err != nil {
+			s.logger.Error("mark workflow job in_progress", "id", startID, "job_id", id, "error", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		workflowName := workflowNameFor(event.WorkflowJob.WorkflowName, event.WorkflowRun.Name)
+		jobName := workflowJobName(st, event.WorkflowJob)
+		metrics.RecordWorkflowStarted(st.RepositoryFullName, workflowName, jobName, st.ProfileName)
+		s.recordWorkflowQueueDuration(st, workflowName, jobName)
+		s.logger.Info("workflow_job in_progress handled", "job_id", id, "request_id", startID, "repository", st.RepositoryFullName, "status", st.Status, "matched_by", reason)
+		writeJSON(w, http.StatusAccepted, st)
 	case "completed":
 		stopID, reason := s.completedWorkflowJobStopID(event.WorkflowJob)
 		if stopID == "" {
@@ -484,10 +504,11 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		conclusion := workflowConclusion(event.WorkflowJob)
 		jobName := workflowJobName(st, event.WorkflowJob)
-		metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowNameOrUnknown(event.WorkflowRun.Name), jobName, st.ProfileName, conclusion)
-		s.recordWorkflowRunDuration(st, event.WorkflowRun.Name, jobName, conclusion)
+		workflowName := workflowNameFor(event.WorkflowJob.WorkflowName, event.WorkflowRun.Name)
+		metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowName, jobName, st.ProfileName, conclusion)
+		s.recordWorkflowRunDuration(st, workflowName, jobName, conclusion)
 		if isFailureConclusion(conclusion) {
-			metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowNameOrUnknown(event.WorkflowRun.Name), jobName, st.ProfileName, "workflow_job", conclusion)
+			metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowName, jobName, st.ProfileName, "workflow_job", conclusion)
 		}
 		s.logger.Info("workflow_job completed handled", "job_id", id, "request_id", stopID, "repository", st.RepositoryFullName, "status", st.Status, "matched_by", reason)
 		writeJSON(w, http.StatusAccepted, st)
@@ -521,12 +542,14 @@ func workflowConclusion(job github.WorkflowJob) string {
 	return "unknown"
 }
 
-func workflowNameOrUnknown(workflow string) string {
-	workflow = strings.TrimSpace(workflow)
-	if workflow == "" {
-		return "unknown"
+func workflowNameFor(candidates ...string) string {
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" {
+			return candidate
+		}
 	}
-	return workflow
+	return "unknown"
 }
 
 func workflowJobName(st state.RunnerState, job github.WorkflowJob) string {
@@ -543,12 +566,7 @@ func workflowJobName(st state.RunnerState, job github.WorkflowJob) string {
 }
 
 func isFailureConclusion(conclusion string) bool {
-	switch strings.ToLower(strings.TrimSpace(conclusion)) {
-	case "", "success", "completed":
-		return false
-	default:
-		return true
-	}
+	return strings.EqualFold(strings.TrimSpace(conclusion), "failure")
 }
 
 func (s *Server) recordWorkflowQueueDuration(st state.RunnerState, workflow, job string) {
@@ -560,7 +578,7 @@ func (s *Server) recordWorkflowQueueDuration(st state.RunnerState, workflow, job
 	if end.IsZero() {
 		end = time.Now().UTC()
 	}
-	metrics.RecordWorkflowQueueDuration(st.RepositoryFullName, workflowNameOrUnknown(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, end.Sub(start))
+	metrics.RecordWorkflowQueueDuration(st.RepositoryFullName, workflowNameFor(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, end.Sub(start))
 }
 
 func (s *Server) recordWorkflowRunDuration(st state.RunnerState, workflow, job, conclusion string) {
@@ -575,7 +593,7 @@ func (s *Server) recordWorkflowRunDuration(st state.RunnerState, workflow, job, 
 	if start.IsZero() || end.IsZero() {
 		return
 	}
-	metrics.RecordWorkflowRunDuration(st.RepositoryFullName, workflowNameOrUnknown(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, conclusion, end.Sub(start))
+	metrics.RecordWorkflowRunDuration(st.RepositoryFullName, workflowNameFor(workflow), workflowJobName(st, github.WorkflowJob{Name: job}), st.ProfileName, conclusion, end.Sub(start))
 }
 
 func (s *Server) handleWorkflowRunWebhook(w http.ResponseWriter, r *http.Request, body []byte) {
@@ -1509,8 +1527,6 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("sandbox runner started sandbox_id=%s pid=%d\n", result.SandboxID, result.PID)))
 	metrics.RecordCreate(req.ProfileName, time.Since(createStartedAt), "success")
 	metrics.RecordRunnerRegistered(req.ProfileName, "success")
-	metrics.RecordWorkflowStarted(req.RepositoryFullName, "unknown", req.RunnerName, req.ProfileName)
-	s.recordWorkflowQueueDuration(st, "", req.RunnerName)
 	s.refreshMetrics()
 	<-exitCh
 }
@@ -1572,11 +1588,32 @@ func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reaso
 	s.store.AppendLog(id, "control.log", []byte("runner skipped before sandbox start: "+reason+"\n"))
 	conclusion := workflowConclusion(job)
 	jobName := workflowJobName(st, job)
-	metrics.RecordWorkflowCompleted(st.RepositoryFullName, "unknown", jobName, st.ProfileName, conclusion)
+	metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowNameFor(job.WorkflowName), jobName, st.ProfileName, conclusion)
 	if isFailureConclusion(conclusion) {
-		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", jobName, st.ProfileName, "workflow_job", conclusion)
+		metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowNameFor(job.WorkflowName), jobName, st.ProfileName, "workflow_job", conclusion)
 	}
 	s.refreshMetrics()
+}
+
+func (s *Server) markWorkflowJobInProgress(id string, job github.WorkflowJob) (state.RunnerState, error) {
+	unlock := s.lockRunner(id)
+	defer unlock()
+
+	st, err := s.store.ReadState(id)
+	if err != nil {
+		return state.RunnerState{}, err
+	}
+	if st.Status == state.StatusCompleted || st.Status == state.StatusStopping {
+		return st, nil
+	}
+	if shouldRecordAssignedJob(st, job) {
+		st.AssignedJobID = job.ID
+		st.AssignedJobName = job.Name
+		if err := s.store.WriteState(st); err != nil {
+			return state.RunnerState{}, err
+		}
+	}
+	return st, nil
 }
 
 func (s *Server) appendRunnerStdout(id string, data []byte) {
@@ -1690,12 +1727,10 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 		st.CompletedAt = time.Now().UTC()
 	}
 	s.cleanupGitHubRunner(context.Background(), st)
-	conclusion := "success"
 	if st.Status == state.StatusFailed {
-		conclusion = "failure"
 		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
+		s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), "failure")
 	}
-	s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), conclusion)
 	s.writeStateOrLog(id, st, "write exited state")
 	s.refreshMetrics()
 }
@@ -1850,7 +1885,6 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 	}
 	s.logger.Info("runner stopped", "id", id, "sandbox_id", st.SandboxID, "duration_ms", time.Since(stopStartedAt).Milliseconds())
 	metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
-	s.recordWorkflowRunDuration(st, "", workflowJobName(st, job), workflowConclusion(job))
 	s.refreshMetrics()
 	return st, nil
 }
