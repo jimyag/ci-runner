@@ -223,10 +223,10 @@ Settings -> Webhooks -> Add webhook
 - Payload URL：`https://<public-host>/webhooks/github`
 - Content type：`application/json`
 - Secret：和 `GITHUB_WEBHOOK_SECRET` 完全一致。
-- Which events：选择 `Workflow jobs`。
+- Which events：选择 `Workflow jobs`。如果希望开启补偿路径，也可以同时选择 `Workflow runs`。
 - Active：勾选。
 
-保存后，GitHub 会发送一次 ping。当前服务只处理 `workflow_job` 事件，非 `workflow_job` 会返回 ignored，这是正常的。
+保存后，GitHub 会发送一次 ping。当前服务处理 `workflow_job` 作为主路径，也处理 `workflow_run.requested` / `workflow_run.in_progress` 作为补偿路径；其他事件会返回 ignored，这是正常的。
 
 ## 7. 配置 GitHub Actions Workflow
 
@@ -256,6 +256,8 @@ jobs:
 3. 服务创建 sandbox，获取 GitHub registration token，并在 sandbox 内启动 ephemeral runner。
 4. GitHub job 被 `self-hosted,e2b` runner 接走执行。
 5. runner 进程退出后，服务清理对应 sandbox。
+
+如果同时配置了 `Workflow runs` 事件，`workflow_run.requested` / `workflow_run.in_progress` 只作为补偿信号：runnerd 会查询该 run 下仍处于 `queued` 的 jobs，并为尚未通过 `workflow_job` 入队的 job 补建 runner request。这个补偿动作本身不会让 GitHub Actions UI 立刻显示 job 正在运行；UI 会继续显示 queued / waiting for runner，直到 sandbox 内的 ephemeral runner 注册成功并被 GitHub 分配到该 job 后才会变成 in progress / running。
 
 ## 8. 排查顺序
 

@@ -22,6 +22,8 @@ The config file covers:
 - worker lease / retry / concurrency settings
 - runner spec and runner-policy seed data
 
+Relative `github.app.private_key_file` paths are resolved from the directory containing `runnerd.yaml`.
+
 `/webhooks/github` uses GitHub HMAC signature verification. The manual management API under `/runner_requests` requires `Authorization: Bearer $ADMIN_TOKEN`.
 
 Runner state is persisted in a DB-backed store instead of per-request JSON directories. Control/stdout/stderr logs are kept as runner events and remain available from the admin API and UI.
@@ -59,4 +61,4 @@ task docker-check
 task release-check
 ```
 
-Use `runs-on: [self-hosted, e2b]` in the target workflow. Configure a GitHub webhook for `workflow_job` events pointing at `POST /webhooks/github`.
+Use `runs-on: [self-hosted, e2b]` in the target workflow. Configure a GitHub webhook for `workflow_job` events pointing at `POST /webhooks/github`. You can also include `workflow_run` events as a compensating signal; runnerd lists all queued jobs in the run and enqueues any matching jobs not already seen from `workflow_job`.

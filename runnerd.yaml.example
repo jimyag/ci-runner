@@ -32,6 +32,7 @@ github:
   app:
     id: 123456
     installation_id: 12345678
+    # Relative paths are resolved from the directory containing runnerd.yaml.
     private_key_file: ./secrets/github-app.pem
 
 worker:
