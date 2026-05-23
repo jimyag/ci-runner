@@ -319,7 +319,7 @@ func (s *Server) sweepOnce() {
 			}
 			if !st.RunningAt.IsZero() && now.Sub(st.RunningAt) > s.cfg.SandboxTimeout {
 				s.logger.Info("sweeper stopping timed out runner", "id", st.ID, "sandbox_id", st.SandboxID, "running_at", st.RunningAt)
-				s.stopIfExists(context.Background(), st.ID, github.WorkflowJob{})
+				s.failAndStopRunner(context.Background(), st.ID, "sandbox_timeout", "timeout", "runner exceeded sandbox timeout")
 			}
 		case state.StatusStopping:
 			if !st.NextRetryAt.IsZero() && now.Before(st.NextRetryAt) {
@@ -477,7 +477,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
 			return
 		}
-		st, err := s.markWorkflowJobInProgress(startID, event.WorkflowJob)
+		st, recorded, err := s.markWorkflowJobInProgress(startID, event.WorkflowJob)
 		if err != nil {
 			s.logger.Error("mark workflow job in_progress", "id", startID, "job_id", id, "error", err)
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -485,8 +485,10 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		workflowName := workflowNameFor(event.WorkflowJob.WorkflowName, event.WorkflowRun.Name)
 		jobName := workflowJobName(st, event.WorkflowJob)
-		metrics.RecordWorkflowStarted(st.RepositoryFullName, workflowName, jobName, st.ProfileName)
-		s.recordWorkflowQueueDuration(st, workflowName, jobName)
+		if recorded {
+			metrics.RecordWorkflowStarted(st.RepositoryFullName, workflowName, jobName, st.ProfileName)
+			s.recordWorkflowQueueDuration(st, workflowName, jobName)
+		}
 		s.logger.Info("workflow_job in_progress handled", "job_id", id, "request_id", startID, "repository", st.RepositoryFullName, "status", st.Status, "matched_by", reason)
 		writeJSON(w, http.StatusAccepted, st)
 	case "completed":
@@ -496,7 +498,7 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusAccepted, map[string]string{"status": "ignored"})
 			return
 		}
-		st, err := s.stopRunner(context.Background(), stopID, event.WorkflowJob)
+		st, recorded, err := s.stopRunner(context.Background(), stopID, event.WorkflowJob)
 		if err != nil {
 			s.logger.Error("stop runner", "id", stopID, "error", err)
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -505,10 +507,12 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 		conclusion := workflowConclusion(event.WorkflowJob)
 		jobName := workflowJobName(st, event.WorkflowJob)
 		workflowName := workflowNameFor(event.WorkflowJob.WorkflowName, event.WorkflowRun.Name)
-		metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowName, jobName, st.ProfileName, conclusion)
-		s.recordWorkflowRunDuration(st, workflowName, jobName, conclusion)
-		if isFailureConclusion(conclusion) {
-			metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowName, jobName, st.ProfileName, "workflow_job", conclusion)
+		if recorded {
+			metrics.RecordWorkflowCompleted(st.RepositoryFullName, workflowName, jobName, st.ProfileName, conclusion)
+			s.recordWorkflowRunDuration(st, workflowName, jobName, conclusion)
+			if isFailureConclusion(conclusion) {
+				metrics.RecordWorkflowFailure(st.RepositoryFullName, workflowName, jobName, st.ProfileName, "workflow_job", conclusion)
+			}
 		}
 		s.logger.Info("workflow_job completed handled", "job_id", id, "request_id", stopID, "repository", st.RepositoryFullName, "status", st.Status, "matched_by", reason)
 		writeJSON(w, http.StatusAccepted, st)
@@ -809,7 +813,7 @@ func (s *Server) handleDeleteRunner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	st, err := s.stopRunner(context.Background(), id, github.WorkflowJob{})
+	st, _, err := s.stopRunner(context.Background(), id, github.WorkflowJob{})
 	if err != nil {
 		s.logger.Error("delete runner request failed", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1273,11 +1277,6 @@ func (s *Server) handleDiagnosticsVars(w http.ResponseWriter, r *http.Request) {
 func (s *Server) createAndStart(w http.ResponseWriter, r *http.Request, req state.RunnerRequest, payload []byte) {
 	st, created, err := s.enqueueRunnerRequest(req, payload)
 	if err != nil {
-		if errors.Is(err, errRunnerConcurrencyLimit) || errors.Is(err, errProfileConcurrencyLimit) {
-			s.logger.Info("runner request rejected by concurrency limit", "id", req.ID, "repository", req.RepositoryFullName, "profile", req.ProfileName, "error", err)
-			writeError(w, http.StatusTooManyRequests, err.Error())
-			return
-		}
 		s.logger.Error("enqueue runner request failed", "id", req.ID, "repository", req.RepositoryFullName, "profile", req.ProfileName, "error", err)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1290,11 +1289,6 @@ func (s *Server) createAndStart(w http.ResponseWriter, r *http.Request, req stat
 	s.logger.Info("runner request reused", "id", st.ID, "repository", st.RepositoryFullName, "profile", st.ProfileName, "status", st.Status)
 	writeJSON(w, http.StatusOK, st)
 }
-
-var (
-	errRunnerConcurrencyLimit  = errors.New("runner concurrency limit reached")
-	errProfileConcurrencyLimit = errors.New("profile concurrency limit reached")
-)
 
 func (s *Server) enqueueWorkflowJob(repositoryFullName, workflowRunName string, job github.WorkflowJob, payload []byte) (state.RunnerState, bool, error) {
 	id := strconv.FormatInt(job.ID, 10)
@@ -1330,24 +1324,6 @@ func (s *Server) enqueueRunnerRequest(req state.RunnerRequest, payload []byte) (
 		s.admissionMu.Unlock()
 		s.logger.Info("runner request already exists", "id", req.ID, "status", st.Status)
 		return st, false, nil
-	}
-	active, err := s.store.ActiveCount()
-	if err != nil {
-		s.admissionMu.Unlock()
-		return state.RunnerState{}, false, err
-	}
-	if active >= s.cfg.MaxConcurrentRunners {
-		s.admissionMu.Unlock()
-		s.logger.Info("runner global concurrency limit reached", "id", req.ID, "active", active, "limit", s.cfg.MaxConcurrentRunners)
-		return state.RunnerState{}, false, errRunnerConcurrencyLimit
-	}
-	if rejected, err := s.rejectProfileConcurrency(req.ProfileName); err != nil {
-		s.admissionMu.Unlock()
-		return state.RunnerState{}, false, err
-	} else if rejected {
-		s.admissionMu.Unlock()
-		s.logger.Info("runner profile concurrency limit reached", "id", req.ID, "profile", req.ProfileName)
-		return state.RunnerState{}, false, errProfileConcurrencyLimit
 	}
 	created, st, err := s.store.CreateRequest(req, payload)
 	s.admissionMu.Unlock()
@@ -1408,6 +1384,22 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		return
 	}
 	s.admissionMu.Lock()
+	inFlight, err := s.store.InFlightCount()
+	if err != nil {
+		s.admissionMu.Unlock()
+		unlock()
+		_ = s.store.ReleaseLease(id, workerID)
+		s.logger.Error("check global concurrency", "id", id, "error", err)
+		return
+	}
+	if inFlight >= s.cfg.MaxConcurrentRunners {
+		s.admissionMu.Unlock()
+		unlock()
+		s.logger.Info("runner start deferred because global concurrency is at capacity", "id", id, "in_flight", inFlight, "limit", s.cfg.MaxConcurrentRunners)
+		s.deferQueuedRequest(id, workerID, time.Now().UTC().Add(5*time.Second))
+		s.signalQueue()
+		return
+	}
 	if req.ProfileName != "" {
 		rejected, err := s.profileAtCapacity(req.ProfileName)
 		if err != nil {
@@ -1420,8 +1412,8 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		if rejected {
 			s.admissionMu.Unlock()
 			unlock()
-			_ = s.store.ReleaseLease(id, workerID)
 			s.logger.Info("runner start deferred because profile is at capacity", "id", id, "profile", req.ProfileName)
+			s.deferQueuedRequest(id, workerID, time.Now().UTC().Add(5*time.Second))
 			s.signalQueue()
 			return
 		}
@@ -1595,25 +1587,27 @@ func (s *Server) completeWithoutSandbox(id string, job github.WorkflowJob, reaso
 	s.refreshMetrics()
 }
 
-func (s *Server) markWorkflowJobInProgress(id string, job github.WorkflowJob) (state.RunnerState, error) {
+func (s *Server) markWorkflowJobInProgress(id string, job github.WorkflowJob) (state.RunnerState, bool, error) {
 	unlock := s.lockRunner(id)
 	defer unlock()
 
 	st, err := s.store.ReadState(id)
 	if err != nil {
-		return state.RunnerState{}, err
+		return state.RunnerState{}, false, err
 	}
 	if st.Status == state.StatusCompleted || st.Status == state.StatusStopping {
-		return st, nil
+		return st, false, nil
 	}
 	if shouldRecordAssignedJob(st, job) {
+		recordMetric := st.AssignedJobID == 0 && st.AssignedJobName != job.Name
 		st.AssignedJobID = job.ID
 		st.AssignedJobName = job.Name
 		if err := s.store.WriteState(st); err != nil {
-			return state.RunnerState{}, err
+			return state.RunnerState{}, false, err
 		}
+		return st, recordMetric, nil
 	}
-	return st, nil
+	return st, false, nil
 }
 
 func (s *Server) appendRunnerStdout(id string, data []byte) {
@@ -1807,32 +1801,34 @@ func (s *Server) stopIfExists(ctx context.Context, id string, job github.Workflo
 		s.logger.Info("stop skipped because runner state does not exist", "id", id)
 		return
 	}
-	if _, err := s.stopRunner(ctx, id, job); err != nil {
+	if _, _, err := s.stopRunner(ctx, id, job); err != nil {
 		s.logger.Error("stop runner", "id", id, "error", err)
 	}
 }
 
-func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJob) (state.RunnerState, error) {
+func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJob) (state.RunnerState, bool, error) {
 	unlock := s.lockRunner(id)
 	defer unlock()
 
 	st, err := s.store.ReadState(id)
 	if err != nil {
 		s.logger.Error("read runner state for stop", "id", id, "error", err)
-		return state.RunnerState{}, err
+		return state.RunnerState{}, false, err
 	}
 	s.logger.Info("runner stop requested", "id", id, "status", st.Status, "sandbox_id", st.SandboxID, "pid", st.ProcessPID, "job_id", job.ID)
 	if st.Status == state.StatusCompleted {
+		recorded := false
 		if shouldRecordAssignedJob(st, job) {
 			st.AssignedJobID = job.ID
 			st.AssignedJobName = job.Name
 			if err := s.store.WriteState(st); err != nil {
-				return state.RunnerState{}, fmt.Errorf("write completed job assignment: %w", err)
+				return state.RunnerState{}, false, fmt.Errorf("write completed job assignment: %w", err)
 			}
+			recorded = true
 			s.logger.Info("recorded completed runner job assignment", "id", id, "job_id", job.ID, "job_name", job.Name)
 		}
 		s.logger.Info("runner stop skipped because already completed", "id", id)
-		return st, nil
+		return st, recorded, nil
 	}
 	if shouldRecordAssignedJob(st, job) {
 		st.AssignedJobID = job.ID
@@ -1841,7 +1837,7 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 	st.Status = state.StatusStopping
 	stopStartedAt := time.Now()
 	if err := s.store.WriteState(st); err != nil {
-		return state.RunnerState{}, fmt.Errorf("write stopping state: %w", err)
+		return state.RunnerState{}, false, fmt.Errorf("write stopping state: %w", err)
 	}
 	s.logger.Info("runner marked stopping", "id", id, "sandbox_id", st.SandboxID, "pid", st.ProcessPID)
 	st.Version++
@@ -1853,26 +1849,26 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 			} else {
 				if s.scheduleStopRetry(&st, err) {
 					if writeErr := s.store.WriteState(st); writeErr != nil {
-						return state.RunnerState{}, fmt.Errorf("schedule stop retry: %v; write stopping state: %w", err, writeErr)
+						return state.RunnerState{}, false, fmt.Errorf("schedule stop retry: %v; write stopping state: %w", err, writeErr)
 					}
 					s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("stop retry scheduled for %s: %s\n", st.NextRetryAt.Format(time.RFC3339), err)))
 					s.logger.Info("runner stop retry scheduled", "id", id, "sandbox_id", st.SandboxID, "next_retry_at", st.NextRetryAt, "error", err)
 					s.refreshMetrics()
-					return st, nil
+					return st, false, nil
 				}
 				st.Status = state.StatusFailed
 				st.FailureStage = "stop"
 				st.FailureReason = "stop_failed"
 				st.Error = err.Error()
 				if writeErr := s.store.WriteState(st); writeErr != nil {
-					return state.RunnerState{}, fmt.Errorf("stop sandbox: %v; write failed state: %w", err, writeErr)
+					return state.RunnerState{}, false, fmt.Errorf("stop sandbox: %v; write failed state: %w", err, writeErr)
 				}
 				s.logger.Error("runner stop failed", "id", id, "sandbox_id", st.SandboxID, "error", err)
 				metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "failed")
 				metrics.RecordRunnerCleanup(st.ProfileName, "failed")
 				metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, job), st.ProfileName, st.FailureStage, st.FailureReason)
 				s.refreshMetrics()
-				return st, err
+				return st, false, err
 			}
 		}
 	}
@@ -1881,12 +1877,63 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 	st.CompletedAt = time.Now().UTC()
 	st.Error = ""
 	if err := s.store.WriteState(st); err != nil {
-		return state.RunnerState{}, err
+		return state.RunnerState{}, false, err
 	}
 	s.logger.Info("runner stopped", "id", id, "sandbox_id", st.SandboxID, "duration_ms", time.Since(stopStartedAt).Milliseconds())
 	metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
 	s.refreshMetrics()
-	return st, nil
+	return st, true, nil
+}
+
+func (s *Server) failAndStopRunner(ctx context.Context, id, stage, reason, message string) {
+	unlock := s.lockRunner(id)
+	defer unlock()
+
+	st, err := s.store.ReadState(id)
+	if err != nil {
+		s.logger.Error("read runner state for forced stop", "id", id, "error", err)
+		return
+	}
+	if st.Status == state.StatusCompleted || st.Status == state.StatusFailed {
+		return
+	}
+	stopStartedAt := time.Now()
+	st.Status = state.StatusStopping
+	st.FailureStage = stage
+	st.FailureReason = reason
+	st.Error = message
+	if err := s.store.WriteState(st); err != nil {
+		s.logger.Error("write forced stopping state", "id", id, "error", err)
+		return
+	}
+	st.Version++
+	if st.SandboxID != "" {
+		if err := s.stopSandboxWithTimeout(ctx, st.SandboxID, st.ProcessPID); err != nil && !isSandboxGone(err) {
+			st.Status = state.StatusFailed
+			st.FailureStage = "stop"
+			st.FailureReason = "stop_failed"
+			st.Error = "forced stop failed after " + stage + ": " + err.Error()
+			s.writeStateOrLog(id, st, "write forced stop failed state")
+			metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "failed")
+			metrics.RecordRunnerCleanup(st.ProfileName, "failed")
+			metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
+			s.refreshMetrics()
+			return
+		}
+	}
+	s.cleanupGitHubRunner(ctx, st)
+	st.Status = state.StatusFailed
+	st.FailedAt = time.Now().UTC()
+	st.FailureStage = stage
+	st.FailureReason = reason
+	st.Error = message
+	st.LeaseOwner = ""
+	st.LeaseExpiresAt = time.Time{}
+	s.writeStateOrLog(id, st, "write forced failed state")
+	metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
+	metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, stage, reason)
+	s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), "failure")
+	s.refreshMetrics()
 }
 
 func (s *Server) githubRunnerGroup(group string) string {
@@ -2061,6 +2108,28 @@ func (s *Server) retryOrFail(st state.RunnerState, stage string, err error) {
 	s.refreshMetrics()
 }
 
+func (s *Server) deferQueuedRequest(id, workerID string, nextAttempt time.Time) {
+	unlock := s.lockRunner(id)
+	defer unlock()
+	st, err := s.store.ReadState(id)
+	if err != nil {
+		s.logger.Error("read state for queue defer", "id", id, "error", err)
+		_ = s.store.ReleaseLease(id, workerID)
+		return
+	}
+	if st.Status != state.StatusQueued || st.LeaseOwner != workerID {
+		_ = s.store.ReleaseLease(id, workerID)
+		return
+	}
+	st.LeaseOwner = ""
+	st.LeaseExpiresAt = time.Time{}
+	st.NextRetryAt = nextAttempt
+	if err := s.store.WriteState(st); err != nil {
+		s.logger.Error("defer queued request", "id", id, "error", err)
+		_ = s.store.ReleaseLease(id, workerID)
+	}
+}
+
 func (s *Server) scheduleStopRetry(st *state.RunnerState, err error) bool {
 	code, retryable := classifyRetryableError("stop", err)
 	if !retryable || st.RetryCount >= s.cfg.RetryMaxAttempts {
@@ -2078,13 +2147,6 @@ func (s *Server) scheduleStopRetry(st *state.RunnerState, err error) bool {
 	return true
 }
 
-func (s *Server) rejectProfileConcurrency(profileName string) (bool, error) {
-	if strings.TrimSpace(profileName) == "" {
-		return false, nil
-	}
-	return s.profileAtActiveLimit(profileName)
-}
-
 func (s *Server) profileAtCapacity(profileName string) (bool, error) {
 	profile, err := s.store.GetProfile(profileName)
 	if err != nil {
@@ -2098,21 +2160,6 @@ func (s *Server) profileAtCapacity(profileName string) (bool, error) {
 		return false, err
 	}
 	return inFlight >= profile.MaxConcurrency, nil
-}
-
-func (s *Server) profileAtActiveLimit(profileName string) (bool, error) {
-	profile, err := s.store.GetProfile(profileName)
-	if err != nil {
-		return false, err
-	}
-	if profile.MaxConcurrency <= 0 {
-		return false, nil
-	}
-	active, err := s.store.ActiveCountForProfile(profileName)
-	if err != nil {
-		return false, err
-	}
-	return active >= profile.MaxConcurrency, nil
 }
 
 func (s *Server) ensureRepositoryAllowsProfile(repositoryFullName string, profile state.RunnerProfile, requestedLabels []string) error {

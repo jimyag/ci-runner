@@ -141,6 +141,7 @@ type Store interface {
 	WriteState(st RunnerState) error
 	ListStates() ([]RunnerState, error)
 	ActiveCount() (int, error)
+	InFlightCount() (int, error)
 	ActiveCountForProfile(name string) (int, error)
 	InFlightCountForProfile(name string) (int, error)
 	ClaimNextRunnable(workerID string, now time.Time, leaseTTL time.Duration) (RunnerRequest, RunnerState, bool, error)
@@ -482,6 +483,20 @@ func (s *DBStore) ActiveCount() (int, error) {
 	var count int64
 	if err := db.Model(&runnerRequestRecord{}).
 		Where("status IN ?", []string{StatusQueued, StatusCreating, StatusRunning, StatusStopping}).
+		Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+func (s *DBStore) InFlightCount() (int, error) {
+	db, err := s.dbOrEnsure()
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	if err := db.Model(&runnerRequestRecord{}).
+		Where("status IN ?", []string{StatusCreating, StatusRunning, StatusStopping}).
 		Count(&count).Error; err != nil {
 		return 0, err
 	}

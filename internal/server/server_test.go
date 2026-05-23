@@ -721,7 +721,60 @@ func TestRecoverStopsActiveRunnerState(t *testing.T) {
 	}
 }
 
-func TestConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
+func TestSweeperMarksTimedOutRunningRunnerFailed(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners" {
+			w.Write([]byte(`{"runners":[]}`))
+			return
+		}
+		t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+	srv.cfg.SandboxTimeout = time.Nanosecond
+
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "timed-out",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-timed-out",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusRunning
+	st.SandboxID = "sb-timed-out"
+	st.ProcessPID = 42
+	st.RunningAt = time.Now().UTC().Add(-time.Hour)
+	st.AssignedJobName = runnerJobStartedMarker
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.sweepOnce()
+
+	got, err := store.ReadState("timed-out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusFailed {
+		t.Fatalf("expected timed-out runner to be failed, got %#v", got)
+	}
+	if got.FailureStage != "sandbox_timeout" || got.FailureReason != "timeout" {
+		t.Fatalf("expected sandbox timeout failure, got stage=%q reason=%q", got.FailureStage, got.FailureReason)
+	}
+	if fake.stoppedCount() != 1 {
+		t.Fatalf("expected sandbox stop, got %d", fake.stoppedCount())
+	}
+}
+
+func TestConcurrencyLimitDefersStartWithoutDroppingRequest(t *testing.T) {
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
@@ -732,20 +785,89 @@ func TestConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
 	srv := newTestServerWithLimit(t, store, ghServer.URL, fake, 1)
-	if _, _, err := store.CreateRequest(state.RunnerRequest{
+	_, existing, err := store.CreateRequest(state.RunnerRequest{
 		ID:         "existing-active",
 		Source:     "test",
 		Labels:     []string{"self-hosted"},
 		RunnerName: "e2b-existing-active",
-	}, nil); err != nil {
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Status = state.StatusRunning
+	existing.SandboxID = "sb-existing-active"
+	if err := store.WriteState(existing); err != nil {
 		t.Fatal(err)
 	}
 
 	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-2"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected concurrency limit, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected request to be queued, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := store.ReadState("manual-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusQueued {
+		t.Fatalf("expected queued request while global limit is full, got %#v", got)
+	}
+	if fake.startedCount() != 0 {
+		t.Fatalf("expected no sandbox start while global limit is full, got %d", fake.startedCount())
+	}
+}
+
+func TestWorkflowJobQueuedAtCapacityIsRecorded(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token" {
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"2026-05-18T10:00:00Z"}`))
+			return
+		}
+		t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServerWithLimit(t, store, ghServer.URL, fake, 1)
+	_, existing, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "existing-active",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-existing-active",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Status = state.StatusRunning
+	existing.SandboxID = "sb-existing-active"
+	if err := store.WriteState(existing); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := []byte(`{"action":"queued","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected queued webhook to be accepted, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := store.ReadState("1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusQueued {
+		t.Fatalf("expected webhook job to be recorded as queued, got %#v", got)
+	}
+	if fake.startedCount() != 0 {
+		t.Fatalf("expected no sandbox start while global limit is full, got %d", fake.startedCount())
 	}
 }
 
@@ -1082,8 +1204,18 @@ func TestProfileConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 	req = adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-2"}`))
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected profile concurrency rejection, got %d body=%s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected profile concurrency queueing, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := store.ReadState("profile-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusQueued {
+		t.Fatalf("expected second profile request to stay queued, got %#v", got)
+	}
+	if fake.startedCount() != 1 {
+		t.Fatalf("expected only first profile runner to start, got %d starts", fake.startedCount())
 	}
 }
 

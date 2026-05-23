@@ -31,3 +31,19 @@ func TestStartScriptEncodesRunnerArguments(t *testing.T) {
 		}
 	}
 }
+
+func TestStartScriptRunsCleanupAfterRunnerExit(t *testing.T) {
+	script := startScript(StartInput{
+		RepositoryURL:     "https://github.com/o/r",
+		RegistrationToken: "token",
+		RunnerName:        "runner",
+		Labels:            []string{"self-hosted", "e2b"},
+	})
+
+	if strings.Contains(script, "exec ./run.sh") {
+		t.Fatalf("script must not exec run.sh because that bypasses the EXIT cleanup trap:\n%s", script)
+	}
+	if !strings.Contains(script, "trap cleanup EXIT") || !strings.Contains(script, "./run.sh") {
+		t.Fatalf("script does not preserve cleanup trap and runner execution:\n%s", script)
+	}
+}

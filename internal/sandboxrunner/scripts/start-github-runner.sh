@@ -67,4 +67,4 @@ cleanup() {
 }
 trap cleanup EXIT
 echo "starting GitHub Actions runner"
-exec ./run.sh
+./run.sh
