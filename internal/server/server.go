@@ -437,12 +437,6 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 	s.logger.Info("workflow_job webhook parsed", "action", event.Action, "job_id", id, "job_name", event.WorkflowJob.Name, "repository", event.Repository.FullName, "runner_name", event.WorkflowJob.RunnerName, "labels", []string(event.WorkflowJob.Labels))
 	switch event.Action {
 	case "queued":
-		match, err := s.store.MatchProfile(event.Repository.FullName, event.WorkflowJob.Labels)
-		if err != nil {
-			s.logger.Error("match workflow job profile", "job_id", id, "repository", event.Repository.FullName, "labels", []string(event.WorkflowJob.Labels), "error", err)
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
 		req := state.RunnerRequest{
 			ID:                 id,
 			Source:             "github_webhook",
@@ -451,6 +445,23 @@ func (s *Server) handleGitHubWebhook(w http.ResponseWriter, r *http.Request) {
 			RequestedLabels:    append([]string(nil), event.WorkflowJob.Labels...),
 			Labels:             []string(event.WorkflowJob.Labels),
 			RunnerName:         "e2b-" + id,
+		}
+		if !s.cfg.RepositoryAllowed(event.Repository.FullName) {
+			s.logger.Info("workflow_job repository rejected by allowlist", "job_id", id, "repository", event.Repository.FullName)
+			st, err := s.rejectAdmission(req, body, "repository_not_allowed")
+			if err != nil {
+				s.logger.Error("write workflow_job repository rejection", "job_id", id, "error", err)
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusAccepted, st)
+			return
+		}
+		match, err := s.store.MatchProfile(event.Repository.FullName, event.WorkflowJob.Labels)
+		if err != nil {
+			s.logger.Error("match workflow job profile", "job_id", id, "repository", event.Repository.FullName, "labels", []string(event.WorkflowJob.Labels), "error", err)
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		if match.Profile == nil {
 			s.logger.Info("workflow_job admission rejected", "job_id", id, "repository", event.Repository.FullName, "labels", []string(event.WorkflowJob.Labels), "reason", match.Reason)
@@ -667,19 +678,23 @@ func (s *Server) handleCreateRunner(w http.ResponseWriter, r *http.Request) {
 	labels := input.Labels
 	requestedLabels := append([]string(nil), labels...)
 	repositoryFullName := strings.TrimSpace(input.RepositoryFullName)
-	if repositoryFullName == "" {
-		repositoryFullName = s.cfg.DefaultRepositoryPattern()
-	}
 	if strings.TrimSpace(repositoryFullName) == "" || strings.Contains(repositoryFullName, "*") {
 		s.logger.Info("manual runner repository missing", "id", id, "repository", repositoryFullName)
 		writeError(w, http.StatusBadRequest, "repository_full_name is required for manual runner creation")
+		return
+	}
+	if !s.cfg.RepositoryAllowed(repositoryFullName) {
+		s.logger.Info("manual runner repository rejected by allowlist", "id", id, "repository", repositoryFullName)
+		writeError(w, http.StatusForbidden, "repository is not allowed")
 		return
 	}
 	profileName := strings.TrimSpace(input.ProfileName)
 	runnerGroup := ""
 	if profileName == "" {
 		if len(labels) == 0 {
-			labels = s.cfg.RunnerLabels
+			s.logger.Info("manual runner labels missing", "id", id, "repository", repositoryFullName)
+			writeError(w, http.StatusBadRequest, "labels are required when runner_spec_name is not provided")
+			return
 		}
 		match, err := s.store.MatchProfile(repositoryFullName, labels)
 		if err != nil {
@@ -864,6 +879,11 @@ func (s *Server) handleCreateProfile(w http.ResponseWriter, r *http.Request) {
 	if input.Enabled != nil {
 		enabled = *input.Enabled
 	}
+	if err := s.validateTemplate(r.Context(), input.TemplateID); err != nil {
+		s.logger.Info("profile template rejected", "name", input.Name, "template_id", input.TemplateID, "error", err)
+		writeTemplateValidationError(w, err)
+		return
+	}
 	profile, err := s.store.UpsertProfile(state.RunnerProfile{
 		Name:             input.Name,
 		Labels:           input.Labels,
@@ -916,6 +936,11 @@ func (s *Server) handlePatchProfile(w http.ResponseWriter, r *http.Request) {
 		current.Labels = input.Labels
 	}
 	if input.TemplateID != "" {
+		if err := s.validateTemplate(r.Context(), input.TemplateID); err != nil {
+			s.logger.Info("profile template rejected", "name", current.Name, "template_id", input.TemplateID, "error", err)
+			writeTemplateValidationError(w, err)
+			return
+		}
 		current.TemplateID = input.TemplateID
 	}
 	if input.RunnerGroup != "" {
@@ -942,6 +967,25 @@ func (s *Server) handlePatchProfile(w http.ResponseWriter, r *http.Request) {
 	s.recordAudit("admin_api", "profile.update", "runner_profile", profile.Name, profile)
 	s.refreshMetrics()
 	writeJSON(w, http.StatusOK, profile)
+}
+
+func (s *Server) validateTemplate(ctx context.Context, templateID string) error {
+	ctx, cancel := context.WithTimeout(ctx, s.cfg.SandboxAPITimeout)
+	defer cancel()
+	return s.sandbox.ValidateTemplate(ctx, templateID)
+}
+
+func writeTemplateValidationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, sandboxrunner.ErrTemplateRequired):
+		writeError(w, http.StatusBadRequest, "template_id is required")
+	case errors.Is(err, sandboxrunner.ErrTemplateNotFound):
+		writeError(w, http.StatusBadRequest, "template_id not found")
+	case errors.Is(err, sandboxrunner.ErrTemplateNotReady):
+		writeError(w, http.StatusBadRequest, "template_id has no ready build")
+	default:
+		writeError(w, http.StatusBadGateway, "validate template_id: "+err.Error())
+	}
 }
 
 func (s *Server) handleDeleteProfile(w http.ResponseWriter, r *http.Request) {
@@ -1244,7 +1288,6 @@ func (s *Server) handleDiagnosticsPprof(w http.ResponseWriter, r *http.Request) 
 		},
 		"sandbox": map[string]any{
 			"api_url": s.cfg.E2BAPIURL,
-			"domain":  s.cfg.E2BDomain,
 		},
 		"recent_failures": failures,
 	})
@@ -1292,10 +1335,6 @@ func (s *Server) createAndStart(w http.ResponseWriter, r *http.Request, req stat
 
 func (s *Server) enqueueWorkflowJob(repositoryFullName, workflowRunName string, job github.WorkflowJob, payload []byte) (state.RunnerState, bool, error) {
 	id := strconv.FormatInt(job.ID, 10)
-	match, err := s.store.MatchProfile(repositoryFullName, job.Labels)
-	if err != nil {
-		return state.RunnerState{}, false, err
-	}
 	req := state.RunnerRequest{
 		ID:                 id,
 		Source:             "github_webhook",
@@ -1304,6 +1343,15 @@ func (s *Server) enqueueWorkflowJob(repositoryFullName, workflowRunName string, 
 		RequestedLabels:    append([]string(nil), job.Labels...),
 		Labels:             []string(job.Labels),
 		RunnerName:         "e2b-" + id,
+	}
+	if !s.cfg.RepositoryAllowed(repositoryFullName) {
+		s.logger.Info("runner repository rejected by allowlist", "id", req.ID, "repository", repositoryFullName, "labels", []string(job.Labels))
+		st, err := s.rejectAdmission(req, payload, "repository_not_allowed")
+		return st, false, err
+	}
+	match, err := s.store.MatchProfile(repositoryFullName, job.Labels)
+	if err != nil {
+		return state.RunnerState{}, false, err
 	}
 	if match.Profile == nil {
 		s.logger.Info("runner admission rejected", "id", req.ID, "repository", repositoryFullName, "labels", []string(job.Labels), "reason", match.Reason)
@@ -1443,7 +1491,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	s.logger.Info("creating github registration token", "id", id)
 	s.store.AppendLog(id, "control.log", []byte("creating github registration token\n"))
 	createStartedAt := time.Now()
-	token, err := s.gh.CreateRegistrationToken(ctx, req.RepositoryFullName)
+	token, err := s.gh.CreateRegistrationToken(ctx, req.RepositoryFullName, req.RunnerGroup)
 	if err != nil {
 		s.failStart(id, st, "github_registration", err)
 		return
@@ -1457,7 +1505,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 	}
 	exitCh := make(chan struct{})
 	createCtx, cancel := context.WithTimeout(ctx, s.cfg.SandboxCreateTimeout)
-	repositoryURL, err := s.gh.RunnerURL(req.RepositoryFullName)
+	repositoryURL, err := s.gh.RunnerURL(req.RepositoryFullName, req.RunnerGroup)
 	if err != nil {
 		cancel()
 		s.failStart(id, st, "github_runner_url", err)
@@ -1469,7 +1517,7 @@ func (s *Server) startRunner(ctx context.Context, id, workerID string) {
 		RepositoryURL:     repositoryURL,
 		RegistrationToken: token.Token,
 		Labels:            req.Labels,
-		RunnerGroup:       s.githubRunnerGroup(req.RunnerGroup),
+		RunnerGroup:       strings.TrimSpace(req.RunnerGroup),
 		TemplateID:        profile.TemplateID,
 		Timeout:           s.cfg.SandboxTimeout,
 		CommandContext:    ctx,
@@ -1936,20 +1984,13 @@ func (s *Server) failAndStopRunner(ctx context.Context, id, stage, reason, messa
 	s.refreshMetrics()
 }
 
-func (s *Server) githubRunnerGroup(group string) string {
-	if s.cfg.RunnerScope != "org" {
-		return ""
-	}
-	return strings.TrimSpace(group)
-}
-
 func (s *Server) cleanupGitHubRunner(ctx context.Context, st state.RunnerState) {
 	if strings.TrimSpace(st.RunnerName) == "" {
 		return
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	removed, err := s.gh.RemoveRunnerByName(cleanupCtx, st.RepositoryFullName, st.RunnerName)
+	removed, err := s.gh.RemoveRunnerByName(cleanupCtx, st.RepositoryFullName, st.RunnerGroup, st.RunnerName)
 	if err != nil {
 		s.logger.Warn("github runner cleanup failed", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName, "error", err)
 		s.store.AppendLog(st.ID, "control.log", []byte("github runner cleanup failed: "+err.Error()+"\n"))

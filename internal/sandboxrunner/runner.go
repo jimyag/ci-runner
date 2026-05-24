@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -40,9 +41,16 @@ type ExitResult struct {
 }
 
 type Service interface {
+	ValidateTemplate(ctx context.Context, templateID string) error
 	StartRunner(ctx context.Context, input StartInput) (StartResult, error)
 	StopRunner(ctx context.Context, sandboxID string, pid uint32) error
 }
+
+var (
+	ErrTemplateRequired = errors.New("template_id is required")
+	ErrTemplateNotFound = errors.New("template not found")
+	ErrTemplateNotReady = errors.New("template is not ready")
+)
 
 type E2BService struct {
 	client *qnsandbox.Client
@@ -58,6 +66,27 @@ func NewE2BService(apiKey, endpoint string, httpClient *http.Client) (*E2BServic
 		return nil, err
 	}
 	return &E2BService{client: client}, nil
+}
+
+func (s *E2BService) ValidateTemplate(ctx context.Context, templateID string) error {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return ErrTemplateRequired
+	}
+	template, err := s.client.GetTemplate(ctx, templateID, nil)
+	if err != nil {
+		var apiErr *qnsandbox.APIError
+		if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+			return ErrTemplateNotFound
+		}
+		return err
+	}
+	for _, build := range template.Builds {
+		if build.Status == qnsandbox.BuildStatusReady {
+			return nil
+		}
+	}
+	return ErrTemplateNotReady
 }
 
 func (s *E2BService) StartRunner(ctx context.Context, input StartInput) (StartResult, error) {

@@ -11,71 +11,37 @@ import (
 )
 
 type Config struct {
-	HTTPAddr                string
-	HTTPReadTimeout         time.Duration
-	HTTPWriteTimeout        time.Duration
-	HTTPIdleTimeout         time.Duration
-	StateDir                string
-	StateBackend            string
-	StateDatabaseURL        string
-	AdminToken              string
-	E2BAPIKey               string
-	E2BAPIURL               string
-	E2BDomain               string
-	GitHubAppID             int64
-	GitHubAppInstallationID int64
-	GitHubAppPrivateKeyFile string
-	GitHubToken             string
-	GitHubBasicAuthUsername string
-	GitHubBasicAuthPassword string
-	GitHubWebhookSecret     string
-	RunnerScope             string
-	GitHubOwner             string
-	GitHubOrg               string
-	GitHubRepo              string
-	SandboxTemplateID       string
-	RunnerLabels            []string
-	SandboxTimeout          time.Duration
-	SandboxAPITimeout       time.Duration
-	SandboxCreateTimeout    time.Duration
-	SandboxStopTimeout      time.Duration
-	RecoveryTimeout         time.Duration
-	WorkerLeaseTTL          time.Duration
-	RunnerIdleTimeout       time.Duration
-	RetryBaseDelay          time.Duration
-	RetryMaxDelay           time.Duration
-	RetryMaxAttempts        int
-	MaxConcurrentRunners    int
-	GitHubAPIBaseURL        string
-	ConfigPath              string
-	RunnerSpecs             []RunnerSpecConfig
-	RunnerGroups            []RunnerGroupConfig
-	RunnerPolicies          []RunnerPolicyConfig
-}
-
-type RunnerSpecConfig struct {
-	Name             string   `yaml:"name"`
-	Labels           []string `yaml:"labels"`
-	TemplateID       string   `yaml:"template_id"`
-	RunnerGroup      string   `yaml:"runner_group"`
-	MaxConcurrency   int      `yaml:"max_concurrency"`
-	MinIdle          int      `yaml:"min_idle"`
-	Priority         int      `yaml:"priority"`
-	Enabled          bool     `yaml:"enabled"`
-	DefaultAvailable bool     `yaml:"default_available"`
-}
-
-type RunnerPolicyConfig struct {
-	Repository    string   `yaml:"repository"`
-	AllowedSpecs  []string `yaml:"allowed_specs"`
-	AllowedGroups []string `yaml:"allowed_groups"`
-}
-
-type RunnerGroupConfig struct {
-	Name        string   `yaml:"name"`
-	Description string   `yaml:"description"`
-	SpecNames   []string `yaml:"spec_names"`
-	Enabled     bool     `yaml:"enabled"`
+	HTTPAddr                  string
+	HTTPReadTimeout           time.Duration
+	HTTPWriteTimeout          time.Duration
+	HTTPIdleTimeout           time.Duration
+	StateDir                  string
+	StateBackend              string
+	StateDatabaseURL          string
+	AdminToken                string
+	E2BAPIKey                 string
+	E2BAPIURL                 string
+	GitHubAppID               int64
+	GitHubAppInstallationID   int64
+	GitHubAppPrivateKeyFile   string
+	GitHubToken               string
+	GitHubBasicAuthUsername   string
+	GitHubBasicAuthPassword   string
+	GitHubWebhookSecret       string
+	GitHubAllowedRepositories []string
+	SandboxTimeout            time.Duration
+	SandboxAPITimeout         time.Duration
+	SandboxCreateTimeout      time.Duration
+	SandboxStopTimeout        time.Duration
+	RecoveryTimeout           time.Duration
+	WorkerLeaseTTL            time.Duration
+	RunnerIdleTimeout         time.Duration
+	RetryBaseDelay            time.Duration
+	RetryMaxDelay             time.Duration
+	RetryMaxAttempts          int
+	MaxConcurrentRunners      int
+	GitHubAPIBaseURL          string
+	ConfigPath                string
 }
 
 type fileConfig struct {
@@ -95,22 +61,19 @@ type fileConfig struct {
 	E2B struct {
 		APIKey           string `yaml:"api_key"`
 		APIURL           string `yaml:"api_url"`
-		Domain           string `yaml:"domain"`
-		TemplateID       string `yaml:"template_id"`
 		TimeoutSec       int    `yaml:"timeout_seconds"`
 		APITimeoutSec    int    `yaml:"api_timeout_seconds"`
 		CreateTimeoutSec int    `yaml:"create_timeout_seconds"`
 		StopTimeoutSec   int    `yaml:"stop_timeout_seconds"`
 	} `yaml:"e2b"`
 	GitHub struct {
-		WebhookSecret string `yaml:"webhook_secret"`
-		APIBaseURL    string `yaml:"api_base_url"`
-		Scope         string `yaml:"scope"`
-		Owner         string `yaml:"owner"`
-		Org           string `yaml:"org"`
-		Repo          string `yaml:"repo"`
-		Token         string `yaml:"token"`
-		BasicAuth     struct {
+		WebhookSecret       string   `yaml:"webhook_secret"`
+		APIBaseURL          string   `yaml:"api_base_url"`
+		AllowedRepositories []string `yaml:"allowed_repositories"`
+		Owner               string   `yaml:"owner"`
+		Repo                string   `yaml:"repo"`
+		Token               string   `yaml:"token"`
+		BasicAuth           struct {
 			Username string `yaml:"username"`
 			Password string `yaml:"password"`
 		} `yaml:"basic_auth"`
@@ -121,18 +84,14 @@ type fileConfig struct {
 		} `yaml:"app"`
 	} `yaml:"github"`
 	Worker struct {
-		RunnerLabels         []string `yaml:"runner_labels"`
-		MaxConcurrentRunners int      `yaml:"max_concurrent_runners"`
-		RunnerIdleTimeoutSec int      `yaml:"runner_idle_timeout_seconds"`
-		RecoveryTimeoutSec   int      `yaml:"recovery_timeout_seconds"`
-		LeaseTTLSec          int      `yaml:"lease_ttl_seconds"`
-		RetryBaseDelaySec    int      `yaml:"retry_base_delay_seconds"`
-		RetryMaxDelaySec     int      `yaml:"retry_max_delay_seconds"`
-		RetryMaxAttempts     int      `yaml:"retry_max_attempts"`
+		MaxConcurrentRunners int `yaml:"max_concurrent_runners"`
+		RunnerIdleTimeoutSec int `yaml:"runner_idle_timeout_seconds"`
+		RecoveryTimeoutSec   int `yaml:"recovery_timeout_seconds"`
+		LeaseTTLSec          int `yaml:"lease_ttl_seconds"`
+		RetryBaseDelaySec    int `yaml:"retry_base_delay_seconds"`
+		RetryMaxDelaySec     int `yaml:"retry_max_delay_seconds"`
+		RetryMaxAttempts     int `yaml:"retry_max_attempts"`
 	} `yaml:"worker"`
-	RunnerSpecs    []RunnerSpecConfig   `yaml:"runner_specs"`
-	RunnerGroups   []RunnerGroupConfig  `yaml:"runner_groups"`
-	RunnerPolicies []RunnerPolicyConfig `yaml:"runner_policies"`
 }
 
 const defaultGitHubAPIBaseURL = "https://api.github.com"
@@ -154,50 +113,41 @@ func LoadFile(path string) (Config, error) {
 	if err := yaml.Unmarshal(data, &raw); err != nil {
 		return Config{}, fmt.Errorf("parse config %q: %w", path, err)
 	}
+	if strings.TrimSpace(raw.GitHub.Owner) != "" || strings.TrimSpace(raw.GitHub.Repo) != "" {
+		return Config{}, fmt.Errorf("invalid config github.owner/github.repo: no longer supported; pass repository_full_name on manual runner requests")
+	}
 	configDir := filepath.Dir(path)
 	cfg := Config{
-		HTTPAddr:                defaultString(raw.Server.HTTPAddr, ":25500"),
-		HTTPReadTimeout:         durationSeconds(raw.Server.ReadTimeoutSec, 15),
-		HTTPWriteTimeout:        durationSeconds(raw.Server.WriteTimeoutSec, 60),
-		HTTPIdleTimeout:         durationSeconds(raw.Server.IdleTimeoutSec, 120),
-		StateBackend:            strings.ToLower(defaultString(raw.Database.Backend, "sqlite")),
-		StateDatabaseURL:        raw.Database.URL,
-		AdminToken:              raw.Admin.Token,
-		E2BAPIKey:               raw.E2B.APIKey,
-		E2BAPIURL:               raw.E2B.APIURL,
-		E2BDomain:               raw.E2B.Domain,
-		GitHubAppID:             raw.GitHub.App.ID,
-		GitHubAppInstallationID: raw.GitHub.App.InstallationID,
-		GitHubAppPrivateKeyFile: resolveConfigPath(configDir, raw.GitHub.App.PrivateKeyFile),
-		GitHubToken:             raw.GitHub.Token,
-		GitHubBasicAuthUsername: raw.GitHub.BasicAuth.Username,
-		GitHubBasicAuthPassword: raw.GitHub.BasicAuth.Password,
-		GitHubWebhookSecret:     raw.GitHub.WebhookSecret,
-		RunnerScope:             strings.ToLower(defaultString(raw.GitHub.Scope, "repo")),
-		GitHubOwner:             raw.GitHub.Owner,
-		GitHubOrg:               raw.GitHub.Org,
-		GitHubRepo:              raw.GitHub.Repo,
-		SandboxTemplateID:       raw.E2B.TemplateID,
-		RunnerLabels:            normalizeLabels(raw.Worker.RunnerLabels),
-		SandboxTimeout:          durationSeconds(raw.E2B.TimeoutSec, 3600),
-		SandboxAPITimeout:       durationSeconds(raw.E2B.APITimeoutSec, 60),
-		SandboxCreateTimeout:    durationSeconds(raw.E2B.CreateTimeoutSec, 120),
-		SandboxStopTimeout:      durationSeconds(raw.E2B.StopTimeoutSec, 30),
-		RecoveryTimeout:         durationSeconds(raw.Worker.RecoveryTimeoutSec, 120),
-		WorkerLeaseTTL:          durationSeconds(raw.Worker.LeaseTTLSec, 300),
-		RunnerIdleTimeout:       durationSeconds(raw.Worker.RunnerIdleTimeoutSec, 300),
-		RetryBaseDelay:          durationSeconds(raw.Worker.RetryBaseDelaySec, 15),
-		RetryMaxDelay:           durationSeconds(raw.Worker.RetryMaxDelaySec, 300),
-		RetryMaxAttempts:        defaultInt(raw.Worker.RetryMaxAttempts, 5),
-		MaxConcurrentRunners:    defaultInt(raw.Worker.MaxConcurrentRunners, 100),
-		GitHubAPIBaseURL:        defaultString(raw.GitHub.APIBaseURL, defaultGitHubAPIBaseURL),
-		ConfigPath:              path,
-		RunnerSpecs:             raw.RunnerSpecs,
-		RunnerGroups:            raw.RunnerGroups,
-		RunnerPolicies:          raw.RunnerPolicies,
-	}
-	if cfg.RunnerScope == "org" && cfg.GitHubOrg == "" {
-		cfg.GitHubOrg = cfg.GitHubOwner
+		HTTPAddr:                  defaultString(raw.Server.HTTPAddr, ":25500"),
+		HTTPReadTimeout:           durationSeconds(raw.Server.ReadTimeoutSec, 15),
+		HTTPWriteTimeout:          durationSeconds(raw.Server.WriteTimeoutSec, 60),
+		HTTPIdleTimeout:           durationSeconds(raw.Server.IdleTimeoutSec, 120),
+		StateBackend:              strings.ToLower(defaultString(raw.Database.Backend, "sqlite")),
+		StateDatabaseURL:          raw.Database.URL,
+		AdminToken:                raw.Admin.Token,
+		E2BAPIKey:                 raw.E2B.APIKey,
+		E2BAPIURL:                 raw.E2B.APIURL,
+		GitHubAppID:               raw.GitHub.App.ID,
+		GitHubAppInstallationID:   raw.GitHub.App.InstallationID,
+		GitHubAppPrivateKeyFile:   resolveConfigPath(configDir, raw.GitHub.App.PrivateKeyFile),
+		GitHubToken:               raw.GitHub.Token,
+		GitHubBasicAuthUsername:   raw.GitHub.BasicAuth.Username,
+		GitHubBasicAuthPassword:   raw.GitHub.BasicAuth.Password,
+		GitHubWebhookSecret:       raw.GitHub.WebhookSecret,
+		GitHubAllowedRepositories: normalizePatterns(raw.GitHub.AllowedRepositories),
+		SandboxTimeout:            durationSeconds(raw.E2B.TimeoutSec, 3600),
+		SandboxAPITimeout:         durationSeconds(raw.E2B.APITimeoutSec, 60),
+		SandboxCreateTimeout:      durationSeconds(raw.E2B.CreateTimeoutSec, 120),
+		SandboxStopTimeout:        durationSeconds(raw.E2B.StopTimeoutSec, 30),
+		RecoveryTimeout:           durationSeconds(raw.Worker.RecoveryTimeoutSec, 120),
+		WorkerLeaseTTL:            durationSeconds(raw.Worker.LeaseTTLSec, 300),
+		RunnerIdleTimeout:         durationSeconds(raw.Worker.RunnerIdleTimeoutSec, 300),
+		RetryBaseDelay:            durationSeconds(raw.Worker.RetryBaseDelaySec, 15),
+		RetryMaxDelay:             durationSeconds(raw.Worker.RetryMaxDelaySec, 300),
+		RetryMaxAttempts:          defaultInt(raw.Worker.RetryMaxAttempts, 5),
+		MaxConcurrentRunners:      defaultInt(raw.Worker.MaxConcurrentRunners, 100),
+		GitHubAPIBaseURL:          defaultString(raw.GitHub.APIBaseURL, defaultGitHubAPIBaseURL),
+		ConfigPath:                path,
 	}
 	if cfg.StateBackend == "sqlite" {
 		if strings.TrimSpace(cfg.StateDatabaseURL) == "" {
@@ -210,7 +160,6 @@ func LoadFile(path string) (Config, error) {
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
-	cfg.ensureDefaultSeeds()
 	return cfg, nil
 }
 
@@ -224,53 +173,12 @@ func (c Config) GitHubAuthMode() string {
 	return "app"
 }
 
-func (c Config) DefaultRepositoryPattern() string {
-	if c.RunnerScope == "org" && c.GitHubOrg != "" {
-		return c.GitHubOrg + "/*"
-	}
-	if c.GitHubOwner != "" && c.GitHubRepo != "" {
-		return c.GitHubOwner + "/" + c.GitHubRepo
-	}
-	return ""
-}
-
-func (c *Config) ensureDefaultSeeds() {
-	if len(c.RunnerSpecs) == 0 {
-		c.RunnerSpecs = []RunnerSpecConfig{{
-			Name:             "default",
-			Labels:           append([]string(nil), c.RunnerLabels...),
-			TemplateID:       c.SandboxTemplateID,
-			RunnerGroup:      "default",
-			MaxConcurrency:   c.MaxConcurrentRunners,
-			Enabled:          true,
-			DefaultAvailable: true,
-		}}
-	}
-	if len(c.RunnerGroups) == 0 {
-		c.RunnerGroups = []RunnerGroupConfig{{
-			Name:      "default",
-			SpecNames: []string{"default"},
-			Enabled:   true,
-		}}
-	}
-	if len(c.RunnerPolicies) == 0 {
-		if repository := c.DefaultRepositoryPattern(); repository != "" {
-			c.RunnerPolicies = []RunnerPolicyConfig{{
-				Repository:    repository,
-				AllowedGroups: []string{"default"},
-			}}
-		}
-	}
-}
-
 func (c Config) validate() error {
 	var missing []string
 	for path, value := range map[string]string{
 		"admin.token":           c.AdminToken,
 		"e2b.api_key":           c.E2BAPIKey,
 		"e2b.api_url":           c.E2BAPIURL,
-		"e2b.domain":            c.E2BDomain,
-		"e2b.template_id":       c.SandboxTemplateID,
 		"github.webhook_secret": c.GitHubWebhookSecret,
 	} {
 		if strings.TrimSpace(value) == "" {
@@ -282,9 +190,6 @@ func (c Config) validate() error {
 		authModes++
 		if c.GitHubAppID == 0 {
 			missing = append(missing, "github.app.id")
-		}
-		if c.GitHubAppInstallationID == 0 {
-			missing = append(missing, "github.app.installation_id")
 		}
 		if strings.TrimSpace(c.GitHubAppPrivateKeyFile) == "" {
 			missing = append(missing, "github.app.private_key_file")
@@ -308,15 +213,6 @@ func (c Config) validate() error {
 	if authModes > 1 {
 		return fmt.Errorf("invalid config github auth: configure exactly one of app, token, or basic_auth")
 	}
-	switch c.RunnerScope {
-	case "repo":
-	case "org":
-		if c.GitHubOrg == "" {
-			missing = append(missing, "github.org")
-		}
-	default:
-		return fmt.Errorf("invalid config github.scope: must be repo or org")
-	}
 	if c.StateBackend != "sqlite" && c.StateBackend != "postgres" {
 		return fmt.Errorf("invalid config database.backend: must be sqlite or postgres")
 	}
@@ -335,10 +231,23 @@ func (c Config) validate() error {
 	if c.RetryMaxAttempts < 1 {
 		return fmt.Errorf("invalid config worker.retry_max_attempts: must be >= 1")
 	}
-	if len(c.RunnerLabels) == 0 {
-		return fmt.Errorf("invalid config worker.runner_labels: must include at least one label")
-	}
 	return nil
+}
+
+func (c Config) RepositoryAllowed(repository string) bool {
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return false
+	}
+	if len(c.GitHubAllowedRepositories) == 0 {
+		return true
+	}
+	for _, pattern := range c.GitHubAllowedRepositories {
+		if repositoryMatches(pattern, repository) {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultString(value, fallback string) string {
@@ -362,18 +271,33 @@ func durationSeconds(value, fallback int) time.Duration {
 	return time.Duration(value) * time.Second
 }
 
-func normalizeLabels(values []string) []string {
+func normalizePatterns(values []string) []string {
 	seen := map[string]bool{}
-	var labels []string
+	var patterns []string
 	for _, value := range values {
-		label := strings.TrimSpace(value)
-		if label == "" || seen[label] {
+		pattern := strings.TrimSpace(value)
+		if pattern == "" || seen[pattern] {
 			continue
 		}
-		seen[label] = true
-		labels = append(labels, label)
+		seen[pattern] = true
+		patterns = append(patterns, pattern)
 	}
-	return labels
+	return patterns
+}
+
+func repositoryMatches(pattern, repository string) bool {
+	pattern = strings.TrimSpace(pattern)
+	repository = strings.TrimSpace(repository)
+	if pattern == "" || repository == "" {
+		return false
+	}
+	if pattern == repository {
+		return true
+	}
+	if strings.HasSuffix(pattern, "/*") {
+		return strings.HasPrefix(repository, strings.TrimSuffix(pattern, "*"))
+	}
+	return false
 }
 
 func resolveConfigPath(configDir, value string) string {

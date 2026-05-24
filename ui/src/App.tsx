@@ -123,7 +123,7 @@ type DiagnosticsSummary = {
   pprof: Array<{ address: string; address_file: string; dump_script: string }>
   state: { backend: string; database: string }
   github: { auth_mode: string; installation_id?: number; api_base_url: string }
-  sandbox: { api_url: string; domain: string }
+  sandbox: { api_url: string }
   recent_failures: RunnerState[]
 }
 
@@ -189,6 +189,7 @@ function App() {
     name: "",
     labels: "self-hosted,e2b",
     template_id: "",
+    runner_group: "",
     group_names: [] as string[],
     max_concurrency: "10",
     min_idle: "0",
@@ -405,7 +406,8 @@ function App() {
       name: "",
       labels: "self-hosted,e2b",
       template_id: "",
-      group_names: runnerGroups[0]?.name ? [runnerGroups[0].name] : [],
+      runner_group: "",
+      group_names: [],
       max_concurrency: "10",
       min_idle: "0",
       priority: "0",
@@ -434,8 +436,13 @@ function App() {
       runner_spec_name?: string
       labels?: string[]
     } = {}
+    const repository = createRepository.trim()
+    if (!repository || repository.includes("*")) {
+      toast.error("repository_full_name must be owner/repo")
+      return
+    }
     if (createID.trim()) body.id = createID.trim()
-    if (createRepository.trim()) body.repository_full_name = createRepository.trim()
+    body.repository_full_name = repository
     if (createRunnerSpec.trim()) body.runner_spec_name = createRunnerSpec.trim()
     const labels = parseLabels(createLabels)
     if (labels.length > 0) body.labels = labels
@@ -484,15 +491,11 @@ function App() {
   const saveRunnerSpec = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     try {
-      if (runnerSpecForm.group_names.length === 0) {
-        toast.error("Select at least one runner group")
-        return
-      }
       const payload = {
         name: runnerSpecForm.name.trim(),
         labels: parseLabels(runnerSpecForm.labels),
         template_id: runnerSpecForm.template_id.trim(),
-        runner_group: runnerSpecForm.group_names[0] || "",
+        runner_group: runnerSpecForm.runner_group.trim(),
         max_concurrency: Number(runnerSpecForm.max_concurrency) || 0,
         min_idle: Number(runnerSpecForm.min_idle) || 0,
         priority: Number(runnerSpecForm.priority) || 0,
@@ -537,6 +540,7 @@ function App() {
       name: runnerSpec.name,
       labels: runnerSpec.labels.join(","),
       template_id: runnerSpec.template_id,
+      runner_group: runnerSpec.runner_group || "",
       group_names: runnerGroups
         .filter((group) => group.spec_names.includes(runnerSpec.name))
         .map((group) => group.name),
@@ -858,7 +862,8 @@ function App() {
                           <Input
                             value={createRepository}
                             onChange={(event) => setCreateRepository(event.target.value)}
-                            placeholder="owner/repo or owner/*"
+                            placeholder="owner/repo"
+                            required
                           />
                           <Input
                             value={createRunnerSpec}
@@ -1068,11 +1073,6 @@ function App() {
                     <Button
                       type="button"
                       onClick={() => {
-                        if (runnerGroups.length === 0) {
-                          toast.error("Create a runner group before adding runner specs")
-                          setSection("runner_groups")
-                          return
-                        }
                         resetRunnerSpecForm()
                         setRunnerSpecOpen(true)
                       }}
@@ -1099,6 +1099,7 @@ function App() {
                         <TableHead>Name</TableHead>
                         <TableHead>Labels</TableHead>
                         <TableHead>Template</TableHead>
+                        <TableHead>GitHub group</TableHead>
                         <TableHead>Runner groups</TableHead>
                         <TableHead>Default</TableHead>
                         <TableHead>Limit</TableHead>
@@ -1111,6 +1112,7 @@ function App() {
                           <TableCell>{runnerSpec.name}</TableCell>
                           <TableCell className="max-w-[260px] truncate">{runnerSpec.labels.join(", ")}</TableCell>
                           <TableCell>{runnerSpec.template_id}</TableCell>
+                          <TableCell>{runnerSpec.runner_group || "-"}</TableCell>
                           <TableCell>{groupNamesForSpec(runnerSpec.name).join(", ") || "-"}</TableCell>
                           <TableCell>{runnerSpec.default_available ? "yes" : "no"}</TableCell>
                           <TableCell>{runnerSpec.max_concurrency}</TableCell>
@@ -1151,14 +1153,21 @@ function App() {
                       onChange={(event) => setRunnerSpecForm((current) => ({ ...current, labels: event.target.value }))}
                       placeholder="self-hosted,e2b"
                     />
-                    <Input
-                      value={runnerSpecForm.template_id}
-                      onChange={(event) => setRunnerSpecForm((current) => ({ ...current, template_id: event.target.value }))}
-                      placeholder="template id"
-                    />
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <Input
+                        value={runnerSpecForm.template_id}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, template_id: event.target.value }))}
+                        placeholder="template id"
+                      />
+                      <Input
+                        value={runnerSpecForm.runner_group}
+                        onChange={(event) => setRunnerSpecForm((current) => ({ ...current, runner_group: event.target.value }))}
+                        placeholder="optional GitHub runner group"
+                      />
+                    </div>
                     <div className="grid gap-2 rounded-md border p-3">
                       {runnerGroups.length === 0 ? (
-                        <div className="text-sm text-muted-foreground">Create a runner group before saving runner specs.</div>
+                        <div className="text-sm text-muted-foreground">No internal runner groups configured.</div>
                       ) : (
                         runnerGroups.map((group) => (
                           <label key={group.name} className="flex items-center gap-2 text-sm">
@@ -1631,7 +1640,6 @@ function App() {
                   <Detail label="Installation" value={diagnostics?.github.installation_id || "-"} />
                   <Detail label="GitHub API" value={diagnostics?.github.api_base_url || "-"} />
                   <Detail label="Sandbox API" value={diagnostics?.sandbox.api_url || "-"} />
-                  <Detail label="Sandbox domain" value={diagnostics?.sandbox.domain || "-"} />
                   <div className="space-y-2">
                     <div className="text-sm font-medium">pprof endpoints</div>
                     {diagnostics?.pprof?.length ? (

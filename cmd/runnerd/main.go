@@ -34,16 +34,12 @@ func main() {
 		logger.Error("ensure state store", "error", err)
 		os.Exit(1)
 	}
-	if err := seedRunnerSpecsAndPolicies(store, cfg); err != nil {
-		logger.Error("seed runner specs and policies", "error", err)
-		os.Exit(1)
-	}
 	githubHTTPClient := &http.Client{Timeout: 30 * time.Second}
-	sandboxHTTPClient := &http.Client{}
+	sandboxHTTPClient := &http.Client{Timeout: cfg.SandboxAPITimeout}
 	var gh *github.Client
 	switch cfg.GitHubAuthMode() {
 	case "app":
-		gh, err = github.NewAppClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, github.AppAuth{
+		gh, err = github.NewAppClient(cfg.GitHubAPIBaseURL, github.AppAuth{
 			AppID:          cfg.GitHubAppID,
 			InstallationID: cfg.GitHubAppInstallationID,
 			PrivateKeyFile: cfg.GitHubAppPrivateKeyFile,
@@ -53,9 +49,9 @@ func main() {
 			os.Exit(1)
 		}
 	case "token":
-		gh = github.NewTokenClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, cfg.GitHubToken, githubHTTPClient)
+		gh = github.NewTokenClient(cfg.GitHubAPIBaseURL, cfg.GitHubToken, githubHTTPClient)
 	case "basic":
-		gh = github.NewBasicAuthClient(cfg.GitHubAPIBaseURL, cfg.RunnerScope, cfg.GitHubOwner, cfg.GitHubOrg, cfg.GitHubRepo, cfg.GitHubBasicAuthUsername, cfg.GitHubBasicAuthPassword, githubHTTPClient)
+		gh = github.NewBasicAuthClient(cfg.GitHubAPIBaseURL, cfg.GitHubBasicAuthUsername, cfg.GitHubBasicAuthPassword, githubHTTPClient)
 	default:
 		logger.Error("unsupported github auth mode", "mode", cfg.GitHubAuthMode())
 		os.Exit(1)
@@ -87,87 +83,4 @@ func main() {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}
-}
-
-func seedRunnerSpecsAndPolicies(store state.Store, cfg config.Config) error {
-	for _, spec := range cfg.RunnerSpecs {
-		if _, err := store.GetProfile(spec.Name); err == nil {
-			continue
-		}
-		if _, err := store.UpsertProfile(state.RunnerProfile{
-			Name:             spec.Name,
-			Labels:           spec.Labels,
-			TemplateID:       spec.TemplateID,
-			RunnerGroup:      spec.RunnerGroup,
-			MaxConcurrency:   spec.MaxConcurrency,
-			MinIdle:          spec.MinIdle,
-			Priority:         spec.Priority,
-			Enabled:          spec.Enabled,
-			DefaultAvailable: spec.DefaultAvailable,
-		}); err != nil {
-			return err
-		}
-	}
-	for _, group := range cfg.RunnerGroups {
-		if _, err := store.GetRunnerGroup(group.Name); err == nil {
-			continue
-		}
-		if _, err := store.UpsertRunnerGroup(state.RunnerGroup{
-			Name:        group.Name,
-			Description: group.Description,
-			SpecNames:   group.SpecNames,
-			Enabled:     group.Enabled,
-		}); err != nil {
-			return err
-		}
-	}
-	existingPolicies, err := store.ListRepositoryPolicies()
-	if err != nil {
-		return err
-	}
-	for _, policy := range cfg.RunnerPolicies {
-		for _, specName := range policy.AllowedSpecs {
-			if repositoryPolicyExists(existingPolicies, policy.Repository, specName) {
-				continue
-			}
-			if _, err := store.UpsertRepositoryPolicy(state.RepositoryPolicy{
-				RepositoryFullName: policy.Repository,
-				ProfileName:        specName,
-				Enabled:            true,
-			}); err != nil {
-				return err
-			}
-		}
-		for _, groupName := range policy.AllowedGroups {
-			if repositoryGroupPolicyExists(existingPolicies, policy.Repository, groupName) {
-				continue
-			}
-			if _, err := store.UpsertRepositoryPolicy(state.RepositoryPolicy{
-				RepositoryFullName: policy.Repository,
-				RunnerGroupName:    groupName,
-				Enabled:            true,
-			}); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func repositoryPolicyExists(policies []state.RepositoryPolicy, repository, profileName string) bool {
-	for _, policy := range policies {
-		if policy.RepositoryFullName == repository && policy.ProfileName == profileName {
-			return true
-		}
-	}
-	return false
-}
-
-func repositoryGroupPolicyExists(policies []state.RepositoryPolicy, repository, groupName string) bool {
-	for _, policy := range policies {
-		if policy.RepositoryFullName == repository && policy.RunnerGroupName == groupName {
-			return true
-		}
-	}
-	return false
 }

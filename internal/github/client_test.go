@@ -16,8 +16,6 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/bradleyfalzon/ghinstallation/v2"
 )
 
 func TestVerifyWebhookSignature(t *testing.T) {
@@ -64,15 +62,15 @@ func TestCreateRegistrationToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
-	token, err := client.CreateRegistrationToken(t.Context(), "")
+	client := NewClient(ts.URL, ts.Client())
+	token, err := client.CreateRegistrationToken(t.Context(), "o/r", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token.Token != "runner-token" {
 		t.Fatalf("unexpected token: %q", token.Token)
 	}
-	token, err = client.CreateRegistrationToken(t.Context(), "")
+	token, err = client.CreateRegistrationToken(t.Context(), "o/r", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,9 +85,16 @@ func TestCreateRegistrationTokenFailure(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
-	if _, err := client.CreateRegistrationToken(t.Context(), ""); err == nil {
+	client := NewClient(ts.URL, ts.Client())
+	if _, err := client.CreateRegistrationToken(t.Context(), "o/r", ""); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestCreateRegistrationTokenRequiresRepository(t *testing.T) {
+	client := NewClient("https://api.github.com", nil)
+	if _, err := client.CreateRegistrationToken(t.Context(), "", ""); err == nil {
+		t.Fatal("expected missing repository error")
 	}
 }
 
@@ -104,22 +109,22 @@ func TestCreateRegistrationTokenUsesRequestRepository(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "", "", "", ts.Client())
-	token, err := client.CreateRegistrationToken(t.Context(), "other/repo")
+	client := NewClient(ts.URL, ts.Client())
+	token, err := client.CreateRegistrationToken(t.Context(), "other/repo", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token.Token != "runner-token" {
 		t.Fatalf("unexpected token: %q", token.Token)
 	}
-	if got, err := client.RunnerURL("other/repo"); err != nil || got != "https://github.com/other/repo" {
+	if got, err := client.RunnerURL("other/repo", ""); err != nil || got != "https://github.com/other/repo" {
 		t.Fatalf("unexpected runner url %q err=%v", got, err)
 	}
 }
 
 func TestNewAppClientUsesConfiguredBaseURLForInstallationTransport(t *testing.T) {
 	privateKey := testPrivateKeyFile(t)
-	client, err := NewAppClient("https://github.example/api/v3", "repo", "o", "", "r", AppAuth{
+	client, err := NewAppClient("https://github.example/api/v3", AppAuth{
 		AppID:          123,
 		InstallationID: 456,
 		PrivateKeyFile: privateKey,
@@ -127,12 +132,105 @@ func TestNewAppClientUsesConfiguredBaseURLForInstallationTransport(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	transport, ok := client.http.Transport.(*ghinstallation.Transport)
-	if !ok {
-		t.Fatalf("unexpected transport type %T", client.http.Transport)
+	if client.appAuth == nil {
+		t.Fatal("expected app authenticator")
 	}
-	if transport.BaseURL != "https://github.example/api/v3" {
-		t.Fatalf("unexpected installation transport base URL: %s", transport.BaseURL)
+	if client.appAuth.baseURL != "https://github.example/api/v3" {
+		t.Fatalf("unexpected app auth base URL: %s", client.appAuth.baseURL)
+	}
+	if client.appAuth.staticInstallationID != 456 {
+		t.Fatalf("unexpected static installation id: %d", client.appAuth.staticInstallationID)
+	}
+}
+
+func TestAppClientResolvesDynamicRepositoryInstallation(t *testing.T) {
+	privateKey := testPrivateKeyFile(t)
+	var installationLookups int
+	var tokenRequests int
+	var registrationAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/installation":
+			installationLookups++
+			if r.Header.Get("Authorization") == "" {
+				t.Fatal("expected app JWT authorization for installation lookup")
+			}
+			w.Write([]byte(`{"id":456}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/456/access_tokens":
+			tokenRequests++
+			if r.Header.Get("Authorization") == "" {
+				t.Fatal("expected app JWT authorization for installation token")
+			}
+			w.Write([]byte(`{"token":"installation-token","expires_at":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/o/r/actions/runners/registration-token":
+			registrationAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	client, err := NewAppClient(ts.URL, AppAuth{
+		AppID:          123,
+		PrivateKeyFile: privateKey,
+	}, ts.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := client.CreateRegistrationToken(t.Context(), "o/r", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.Token != "runner-token" {
+		t.Fatalf("unexpected token: %q", token.Token)
+	}
+	if registrationAuth != "token installation-token" {
+		t.Fatalf("unexpected installation auth header: %q", registrationAuth)
+	}
+	if installationLookups != 1 || tokenRequests != 1 {
+		t.Fatalf("expected cached dynamic installation, lookups=%d tokenRequests=%d", installationLookups, tokenRequests)
+	}
+}
+
+func TestAppClientUsesRepositoryInstallationForOrgRunnerTarget(t *testing.T) {
+	privateKey := testPrivateKeyFile(t)
+	var registrationAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/installation":
+			w.Write([]byte(`{"id":456}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/456/access_tokens":
+			w.Write([]byte(`{"token":"installation-token","expires_at":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/orgs/o/actions/runners/registration-token":
+			registrationAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusCreated)
+			w.Write([]byte(`{"token":"runner-token","expires_at":"` + time.Now().Add(time.Hour).Format(time.RFC3339) + `"}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	client, err := NewAppClient(ts.URL, AppAuth{
+		AppID:          123,
+		PrivateKeyFile: privateKey,
+	}, ts.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := client.CreateRegistrationToken(t.Context(), "o/r", "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token.Token != "runner-token" || registrationAuth != "token installation-token" {
+		t.Fatalf("unexpected token=%q auth=%q", token.Token, registrationAuth)
+	}
+	if got, err := client.RunnerURL("o/r", "default"); err != nil || got != "https://github.com/o" {
+		t.Fatalf("unexpected runner url %q err=%v", got, err)
 	}
 }
 
@@ -147,15 +245,15 @@ func TestCreateOrgRegistrationToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "org", "", "my-org", "", ts.Client())
-	token, err := client.CreateRegistrationToken(t.Context(), "ignored/repo")
+	client := NewClient(ts.URL, ts.Client())
+	token, err := client.CreateRegistrationToken(t.Context(), "my-org/repo", "default")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if token.Token != "runner-token" {
 		t.Fatalf("unexpected token: %q", token.Token)
 	}
-	if got, err := client.RunnerURL("ignored/repo"); err != nil || got != "https://github.com/my-org" {
+	if got, err := client.RunnerURL("my-org/repo", "default"); err != nil || got != "https://github.com/my-org" {
 		t.Fatalf("unexpected runner url: %s", got)
 	}
 }
@@ -170,8 +268,8 @@ func TestTokenAndBasicAuthClientsSetAuthorizationHeader(t *testing.T) {
 	}))
 	defer tokenServer.Close()
 
-	tokenClient := NewTokenClient(tokenServer.URL, "repo", "o", "", "r", "ghp_test", tokenServer.Client())
-	if _, err := tokenClient.CreateRegistrationToken(t.Context(), ""); err != nil {
+	tokenClient := NewTokenClient(tokenServer.URL, "ghp_test", tokenServer.Client())
+	if _, err := tokenClient.CreateRegistrationToken(t.Context(), "o/r", ""); err != nil {
 		t.Fatal(err)
 	}
 	if gotTokenAuth != "Bearer ghp_test" {
@@ -187,8 +285,8 @@ func TestTokenAndBasicAuthClientsSetAuthorizationHeader(t *testing.T) {
 	}))
 	defer basicServer.Close()
 
-	basicClient := NewBasicAuthClient(basicServer.URL, "repo", "o", "", "r", "octo", "secret", basicServer.Client())
-	if _, err := basicClient.CreateRegistrationToken(t.Context(), ""); err != nil {
+	basicClient := NewBasicAuthClient(basicServer.URL, "octo", "secret", basicServer.Client())
+	if _, err := basicClient.CreateRegistrationToken(t.Context(), "o/r", ""); err != nil {
 		t.Fatal(err)
 	}
 	wantBasic := "Basic " + base64.StdEncoding.EncodeToString([]byte("octo:secret"))
@@ -213,8 +311,8 @@ func TestListAndRemoveRunnerByName(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
-	removed, err := client.RemoveRunnerByName(t.Context(), "o/r", "e2b-1001")
+	client := NewClient(ts.URL, ts.Client())
+	removed, err := client.RemoveRunnerByName(t.Context(), "o/r", "", "e2b-1001")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +334,7 @@ func TestListWorkflowRunJobs(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
+	client := NewClient(ts.URL, ts.Client())
 	jobs, err := client.ListWorkflowRunJobs(t.Context(), "o/r", 123)
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +368,7 @@ func TestListWorkflowRunJobsFollowsPagination(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
+	client := NewClient(ts.URL, ts.Client())
 	jobs, err := client.ListWorkflowRunJobs(t.Context(), "o/r", 123)
 	if err != nil {
 		t.Fatal(err)
@@ -293,7 +391,7 @@ func TestGetWorkflowJob(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	client := NewClient(ts.URL, "repo", "o", "", "r", ts.Client())
+	client := NewClient(ts.URL, ts.Client())
 	job, err := client.GetWorkflowJob(t.Context(), "o/r", 1001)
 	if err != nil {
 		t.Fatal(err)

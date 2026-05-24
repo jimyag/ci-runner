@@ -21,31 +21,16 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
-  scope: repo
+  allowed_repositories:
+    - octo/*
   app:
     id: 123
     installation_id: 456
     private_key_file: ./secrets/app.pem
 worker:
-  runner_labels:
-    - self-hosted
-    - e2b
   max_concurrent_runners: 5
-runner_specs:
-  - name: large
-    labels: [self-hosted, e2b, large]
-    template_id: large
-    runner_group: default
-    max_concurrency: 2
-    default_available: true
-    enabled: true
-runner_policies:
-  - repository: octo/repo
-    allowed_specs: [large]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -72,17 +57,101 @@ runner_policies:
 	if cfg.GitHubAppPrivateKeyFile != filepath.Join(dir, "secrets", "app.pem") {
 		t.Fatalf("unexpected private key path: %s", cfg.GitHubAppPrivateKeyFile)
 	}
-	if cfg.DefaultRepositoryPattern() != "" {
-		t.Fatalf("repo scope should not require a default repository, got %q", cfg.DefaultRepositoryPattern())
+	if !cfg.RepositoryAllowed("octo/repo") || cfg.RepositoryAllowed("other/repo") {
+		t.Fatalf("unexpected repository allowlist behavior: %#v", cfg.GitHubAllowedRepositories)
 	}
-	if len(cfg.RunnerSpecs) != 1 || cfg.RunnerSpecs[0].Name != "large" {
-		t.Fatalf("unexpected runner_specs: %#v", cfg.RunnerSpecs)
+}
+
+func TestLoadFileSupportsDynamicGitHubAppInstallation(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+github:
+  webhook_secret: webhook-secret
+  app:
+    id: 123
+    private_key_file: ./secrets/app.pem
+`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !cfg.RunnerSpecs[0].DefaultAvailable {
-		t.Fatalf("expected runner spec to be globally available")
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(cfg.RunnerPolicies) != 1 || cfg.RunnerPolicies[0].Repository != "octo/repo" {
-		t.Fatalf("unexpected repository policies: %#v", cfg.RunnerPolicies)
+	if cfg.GitHubAuthMode() != "app" || cfg.GitHubAppInstallationID != 0 {
+		t.Fatalf("unexpected app config: mode=%s installation_id=%d", cfg.GitHubAuthMode(), cfg.GitHubAppInstallationID)
+	}
+	if !cfg.RepositoryAllowed("any/repo") {
+		t.Fatal("empty allowed_repositories should allow all repositories")
+	}
+}
+
+func TestLoadFileRejectsDeprecatedGitHubDefaultRepository(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+github:
+  webhook_secret: webhook-secret
+  owner: o
+  repo: r
+  app:
+    id: 123
+    private_key_file: ./secrets/app.pem
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadFile(configPath)
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "github.owner/github.repo") {
+		t.Fatalf("expected deprecated owner/repo error, got %v", err)
+	}
+}
+
+func TestLoadFileAllowsEmptyDeprecatedGitHubDefaultRepository(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "runnerd.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+database:
+  backend: sqlite
+  url: ./runnerd.db
+admin:
+  token: admin-token
+e2b:
+  api_key: test-key
+  api_url: https://api.e2b.dev
+github:
+  webhook_secret: webhook-secret
+  owner: ""
+  repo: ""
+  app:
+    id: 123
+    private_key_file: ./secrets/app.pem
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := LoadFile(configPath); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -98,18 +167,13 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
   api_base_url: https://github.example/api/v3
-  scope: repo
   app:
     id: 123
     installation_id: 456
     private_key_file: ./secrets/app.pem
-worker:
-  runner_labels: [self-hosted, e2b]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -135,14 +199,9 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
-  scope: repo
   token: ghp_test
-worker:
-  runner_labels: [self-hosted, e2b]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -168,16 +227,11 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
-  scope: repo
   basic_auth:
     username: octo
     password: secret
-worker:
-  runner_labels: [self-hosted, e2b]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -203,13 +257,8 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
-  scope: repo
-worker:
-  runner_labels: [self-hosted, e2b]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -235,18 +284,13 @@ admin:
 e2b:
   api_key: test-key
   api_url: https://api.e2b.dev
-  domain: example.e2b.dev
-  template_id: base
 github:
   webhook_secret: webhook-secret
-  scope: repo
   token: ghp_test
   app:
     id: 123
     installation_id: 456
     private_key_file: ./secrets/app.pem
-worker:
-  runner_labels: [self-hosted, e2b]
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}

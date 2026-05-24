@@ -27,9 +27,14 @@ type fakeSandbox struct {
 	stopped        int
 	startBlock     chan struct{}
 	stopErr        error
+	templateErr    error
 	commandContext context.Context
 	repositoryURL  string
 	runnerGroup    string
+}
+
+func (f *fakeSandbox) ValidateTemplate(ctx context.Context, templateID string) error {
+	return f.templateErr
 }
 
 func (f *fakeSandbox) StartRunner(ctx context.Context, input sandboxrunner.StartInput) (sandboxrunner.StartResult, error) {
@@ -109,7 +114,7 @@ func TestManualCreateAndDeleteRunner(t *testing.T) {
 	fake := &fakeSandbox{}
 	srv := newTestServer(t, store, ghServer.URL, fake)
 
-	body := bytes.NewBufferString(`{"id":"manual-1"}`)
+	body := bytes.NewBufferString(`{"id":"manual-1","repository_full_name":"o/r","runner_spec_name":"default"}`)
 	req := adminRequest(http.MethodPost, "/runner_requests", body)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
@@ -167,11 +172,19 @@ func TestOrgRunnerPassesMatchedRunnerGroupToSandbox(t *testing.T) {
 	store := state.New(t.TempDir())
 	fake := &fakeSandbox{}
 	srv := newTestServer(t, store, ghServer.URL, fake)
-	srv.cfg.RunnerScope = "org"
-	srv.cfg.GitHubOrg = "o"
-	srv.gh = github.NewClient(ghServer.URL, "org", "", "o", "", http.DefaultClient)
+	srv.gh = github.NewClient(ghServer.URL, http.DefaultClient)
+	if _, err := store.UpsertProfile(state.RunnerProfile{
+		Name:           "default",
+		Labels:         []string{"self-hosted", "e2b"},
+		TemplateID:     "base",
+		RunnerGroup:    "default",
+		MaxConcurrency: 10,
+		Enabled:        true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"org-1","repository_full_name":"o/r"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"org-1","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -450,6 +463,33 @@ func TestWebhookQueuedUsesEventRepositoryForRepoRunner(t *testing.T) {
 	}
 }
 
+func TestWebhookQueuedRejectsRepositoriesOutsideAllowlist(t *testing.T) {
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, "http://example.test", fake)
+	srv.cfg.GitHubAllowedRepositories = []string{"allowed/*"}
+
+	payload := []byte(`{"action":"queued","repository":{"full_name":"blocked/repo"},"workflow_job":{"id":1001,"labels":["self-hosted","e2b"]}}`)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(payload))
+	req.Header.Set("X-GitHub-Event", "workflow_job")
+	req.Header.Set("X-Hub-Signature-256", sign("secret", payload))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("unexpected queued status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	got, err := store.ReadState("1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusFailed || got.FailureReason != "repository_not_allowed" {
+		t.Fatalf("expected allowlist admission failure, got %#v", got)
+	}
+	if fake.startedCount() != 0 {
+		t.Fatalf("expected no sandbox start, got %d", fake.startedCount())
+	}
+}
+
 func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
 	ghServer := httptest.NewServer(githubRunnerAPI(t))
 	defer ghServer.Close()
@@ -655,7 +695,7 @@ func TestStopDuringCreateCleansStartedSandbox(t *testing.T) {
 	fake := &fakeSandbox{startBlock: block}
 	srv := newTestServer(t, store, ghServer.URL, fake)
 
-	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-creating"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-creating","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -800,7 +840,7 @@ func TestConcurrencyLimitDefersStartWithoutDroppingRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-2"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"manual-2","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -899,6 +939,51 @@ func TestProfileAndRepositoryPolicyEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"name":"large"`) {
 		t.Fatalf("expected large profile in match response, got %s", rec.Body.String())
+	}
+}
+
+func TestCreateProfileRejectsInvalidTemplate(t *testing.T) {
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{templateErr: sandboxrunner.ErrTemplateNotFound})
+
+	profileBody := bytes.NewBufferString(`{"name":"large","labels":["self-hosted","e2b","large"],"template_id":"missing-template","max_concurrency":5,"enabled":true}`)
+	req := adminRequest(http.MethodPost, "/runner_specs", profileBody)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, err := store.GetProfile("large"); err == nil {
+		t.Fatal("profile with invalid template should not be persisted")
+	}
+}
+
+func TestPatchProfileRejectsInvalidTemplate(t *testing.T) {
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, "http://example.test", fake)
+
+	profileBody := bytes.NewBufferString(`{"name":"large","labels":["self-hosted","e2b","large"],"template_id":"valid-template","max_concurrency":5,"enabled":true}`)
+	req := adminRequest(http.MethodPost, "/runner_specs", profileBody)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("unexpected create profile status: %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	fake.templateErr = sandboxrunner.ErrTemplateNotReady
+	req = adminRequest(http.MethodPatch, "/runner_specs/large", bytes.NewBufferString(`{"template_id":"not-ready-template"}`))
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	profile, err := store.GetProfile("large")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.TemplateID != "valid-template" {
+		t.Fatalf("invalid template update should not be persisted: %#v", profile)
 	}
 }
 
@@ -1023,7 +1108,7 @@ func TestRetryRunnerRejectsRunningRequest(t *testing.T) {
 	store := state.New(t.TempDir())
 	srv := newTestServerWithLimit(t, store, ghServer.URL, &fakeSandbox{}, 10)
 
-	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"running-retry"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"running-retry","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -1193,7 +1278,7 @@ func TestProfileConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-1"}`))
+	req := adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-1","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -1201,7 +1286,7 @@ func TestProfileConcurrencyLimitAppliesBeforeCreate(t *testing.T) {
 	}
 	waitForState(t, store, "profile-1", state.StatusRunning)
 
-	req = adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-2"}`))
+	req = adminRequest(http.MethodPost, "/runner_requests", bytes.NewBufferString(`{"id":"profile-2","repository_full_name":"o/r","runner_spec_name":"default"}`))
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusAccepted {
@@ -1232,10 +1317,6 @@ func newTestServerWithLimit(t *testing.T, store state.Store, ghURL string, fake 
 		StateDatabaseURL:     "./var/runnerd.db",
 		AdminToken:           "admin-token",
 		GitHubWebhookSecret:  "secret",
-		GitHubOwner:          "o",
-		GitHubRepo:           "r",
-		SandboxTemplateID:    "base",
-		RunnerLabels:         []string{"self-hosted", "e2b"},
 		SandboxTimeout:       time.Hour,
 		SandboxCreateTimeout: time.Second,
 		SandboxStopTimeout:   time.Second,
@@ -1251,7 +1332,6 @@ func newTestServerWithLimit(t *testing.T, store state.Store, ghURL string, fake 
 		Name:           "default",
 		Labels:         []string{"self-hosted", "e2b"},
 		TemplateID:     "base",
-		RunnerGroup:    "default",
 		MaxConcurrency: limit,
 		Enabled:        true,
 	}); err != nil {
@@ -1264,7 +1344,7 @@ func newTestServerWithLimit(t *testing.T, store state.Store, ghURL string, fake 
 	}); err != nil {
 		panic(err)
 	}
-	gh := github.NewClient(ghURL, "repo", "o", "", "r", http.DefaultClient)
+	gh := github.NewClient(ghURL, http.DefaultClient)
 	srv := New(cfg, store, gh, fake, nil)
 	t.Cleanup(srv.Close)
 	return srv

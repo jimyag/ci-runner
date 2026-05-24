@@ -22,11 +22,8 @@ import (
 
 type Client struct {
 	baseURL   string
-	scope     string
-	owner     string
-	org       string
-	repo      string
 	http      *http.Client
+	appAuth   *appAuthenticator
 	tokensMu  sync.Mutex
 	regTokens map[string]RegistrationToken
 }
@@ -35,6 +32,17 @@ type AppAuth struct {
 	AppID          int64
 	InstallationID int64
 	PrivateKeyFile string
+}
+
+type appAuthenticator struct {
+	baseURL              string
+	staticInstallationID int64
+	httpClient           *http.Client
+	appHTTP              *http.Client
+	appTransport         *ghinstallation.AppsTransport
+	mu                   sync.Mutex
+	installationByRepo   map[string]int64
+	transports           map[int64]*ghinstallation.Transport
 }
 
 type RegistrationToken struct {
@@ -49,25 +57,25 @@ type Runner struct {
 	Busy   bool   `json:"busy"`
 }
 
-func NewClient(baseURL, scope, owner, org, repo string, httpClient *http.Client) *Client {
+type runnerTarget struct {
+	repositoryFullName string
+	apiPath            string
+	webURL             string
+	cacheKey           string
+}
+
+func NewClient(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	if org == "" {
-		org = owner
-	}
 	return &Client{
 		baseURL:   strings.TrimRight(baseURL, "/"),
-		scope:     scope,
-		owner:     owner,
-		org:       org,
-		repo:      repo,
 		http:      httpClient,
 		regTokens: map[string]RegistrationToken{},
 	}
 }
 
-func NewAppClient(baseURL, scope, owner, org, repo string, auth AppAuth, httpClient *http.Client) (*Client, error) {
+func NewAppClient(baseURL string, auth AppAuth, httpClient *http.Client) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
@@ -79,57 +87,62 @@ func NewAppClient(baseURL, scope, owner, org, repo string, auth AppAuth, httpCli
 	if baseTransport == nil {
 		baseTransport = http.DefaultTransport
 	}
-	transport, err := ghinstallation.New(baseTransport, auth.AppID, auth.InstallationID, privateKey)
+	appTransport, err := ghinstallation.NewAppsTransport(baseTransport, auth.AppID, privateKey)
 	if err != nil {
 		return nil, err
 	}
-	transport.BaseURL = strings.TrimRight(baseURL, "/")
+	appTransport.BaseURL = strings.TrimRight(baseURL, "/")
+	appHTTP := *httpClient
+	appHTTP.Transport = appTransport
 	cloned := *httpClient
-	cloned.Transport = transport
-	return NewClient(baseURL, scope, owner, org, repo, &cloned), nil
+	cloned.Transport = baseTransport
+	client := NewClient(baseURL, &cloned)
+	client.appAuth = &appAuthenticator{
+		baseURL:              strings.TrimRight(baseURL, "/"),
+		staticInstallationID: auth.InstallationID,
+		httpClient:           &cloned,
+		appHTTP:              &appHTTP,
+		appTransport:         appTransport,
+		installationByRepo:   map[string]int64{},
+		transports:           map[int64]*ghinstallation.Transport{},
+	}
+	return client, nil
 }
 
-func NewTokenClient(baseURL, scope, owner, org, repo, token string, httpClient *http.Client) *Client {
-	return NewClient(baseURL, scope, owner, org, repo, clientWithTransport(httpClient, bearerTransport{
+func NewTokenClient(baseURL, token string, httpClient *http.Client) *Client {
+	return NewClient(baseURL, clientWithTransport(httpClient, bearerTransport{
 		token: strings.TrimSpace(token),
 	}))
 }
 
-func NewBasicAuthClient(baseURL, scope, owner, org, repo, username, password string, httpClient *http.Client) *Client {
-	return NewClient(baseURL, scope, owner, org, repo, clientWithTransport(httpClient, basicAuthTransport{
+func NewBasicAuthClient(baseURL, username, password string, httpClient *http.Client) *Client {
+	return NewClient(baseURL, clientWithTransport(httpClient, basicAuthTransport{
 		username: username,
 		password: password,
 	}))
 }
 
-func (c *Client) RunnerURL(repositoryFullName string) (string, error) {
-	if c.scope == "org" {
-		return fmt.Sprintf("https://github.com/%s", c.org), nil
+func (c *Client) RunnerURL(repositoryFullName, runnerGroup string) (string, error) {
+	target, err := c.runnerTarget(repositoryFullName, runnerGroup)
+	if err != nil {
+		return "", err
 	}
-	repositoryFullName = c.repositoryFullName(repositoryFullName)
-	if repositoryFullName == "" {
-		return "", fmt.Errorf("repository full name is required for repo runner scope")
-	}
-	return fmt.Sprintf("https://github.com/%s", repositoryFullName), nil
+	return target.webURL, nil
 }
 
-func (c *Client) CreateRegistrationToken(ctx context.Context, repositoryFullName string) (RegistrationToken, error) {
+func (c *Client) CreateRegistrationToken(ctx context.Context, repositoryFullName, runnerGroup string) (RegistrationToken, error) {
 	startedAt := time.Now()
 	result := "error"
 	defer func() { metrics.RecordGitHubAPI("create_registration_token", result, time.Since(startedAt)) }()
-	repositoryFullName = c.repositoryFullName(repositoryFullName)
-	if c.scope != "org" && repositoryFullName == "" {
-		return RegistrationToken{}, fmt.Errorf("repository full name is required for repo runner scope")
+	target, err := c.runnerTarget(repositoryFullName, runnerGroup)
+	if err != nil {
+		return RegistrationToken{}, err
 	}
-	cacheKey := c.registrationTokenKey(repositoryFullName)
-	if token, ok := c.cachedRegistrationToken(cacheKey); ok {
+	if token, ok := c.cachedRegistrationToken(target.cacheKey); ok {
 		result = "cache_hit"
 		return token, nil
 	}
-	url := fmt.Sprintf("%s/repos/%s/actions/runners/registration-token", c.baseURL, repositoryFullName)
-	if c.scope == "org" {
-		url = fmt.Sprintf("%s/orgs/%s/actions/runners/registration-token", c.baseURL, c.org)
-	}
+	url := fmt.Sprintf("%s/%s/actions/runners/registration-token", c.baseURL, target.apiPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(nil))
 	if err != nil {
 		return RegistrationToken{}, err
@@ -137,7 +150,7 @@ func (c *Client) CreateRegistrationToken(ctx context.Context, repositoryFullName
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, target.repositoryFullName)
 	if err != nil {
 		return RegistrationToken{}, err
 	}
@@ -153,23 +166,20 @@ func (c *Client) CreateRegistrationToken(ctx context.Context, repositoryFullName
 	if token.Token == "" {
 		return RegistrationToken{}, fmt.Errorf("github registration token response missing token")
 	}
-	c.storeRegistrationToken(cacheKey, token)
+	c.storeRegistrationToken(target.cacheKey, token)
 	result = "success"
 	return token, nil
 }
 
-func (c *Client) ListRunners(ctx context.Context, repositoryFullName string) ([]Runner, error) {
+func (c *Client) ListRunners(ctx context.Context, repositoryFullName, runnerGroup string) ([]Runner, error) {
 	startedAt := time.Now()
 	result := "error"
 	defer func() { metrics.RecordGitHubAPI("list_runners", result, time.Since(startedAt)) }()
-	repositoryFullName = c.repositoryFullName(repositoryFullName)
-	if c.scope != "org" && repositoryFullName == "" {
-		return nil, fmt.Errorf("repository full name is required for repo runner scope")
+	target, err := c.runnerTarget(repositoryFullName, runnerGroup)
+	if err != nil {
+		return nil, err
 	}
-	nextURL := fmt.Sprintf("%s/repos/%s/actions/runners?per_page=100", c.baseURL, repositoryFullName)
-	if c.scope == "org" {
-		nextURL = fmt.Sprintf("%s/orgs/%s/actions/runners?per_page=100", c.baseURL, c.org)
-	}
+	nextURL := fmt.Sprintf("%s/%s/actions/runners?per_page=100", c.baseURL, target.apiPath)
 	var runners []Runner
 	for nextURL != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
@@ -177,7 +187,7 @@ func (c *Client) ListRunners(ctx context.Context, repositoryFullName string) ([]
 			return nil, err
 		}
 		setGitHubHeaders(req)
-		resp, err := c.http.Do(req)
+		resp, err := c.do(req, target.repositoryFullName)
 		if err != nil {
 			return nil, err
 		}
@@ -199,27 +209,24 @@ func (c *Client) ListRunners(ctx context.Context, repositoryFullName string) ([]
 	return runners, nil
 }
 
-func (c *Client) RemoveRunner(ctx context.Context, repositoryFullName string, runnerID int64) error {
+func (c *Client) RemoveRunner(ctx context.Context, repositoryFullName, runnerGroup string, runnerID int64) error {
 	startedAt := time.Now()
 	result := "error"
 	defer func() { metrics.RecordGitHubAPI("remove_runner", result, time.Since(startedAt)) }()
 	if runnerID == 0 {
 		return fmt.Errorf("runner id is required")
 	}
-	repositoryFullName = c.repositoryFullName(repositoryFullName)
-	if c.scope != "org" && repositoryFullName == "" {
-		return fmt.Errorf("repository full name is required for repo runner scope")
+	target, err := c.runnerTarget(repositoryFullName, runnerGroup)
+	if err != nil {
+		return err
 	}
-	url := fmt.Sprintf("%s/repos/%s/actions/runners/%d", c.baseURL, repositoryFullName, runnerID)
-	if c.scope == "org" {
-		url = fmt.Sprintf("%s/orgs/%s/actions/runners/%d", c.baseURL, c.org, runnerID)
-	}
+	url := fmt.Sprintf("%s/%s/actions/runners/%d", c.baseURL, target.apiPath, runnerID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return err
 	}
 	setGitHubHeaders(req)
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, target.repositoryFullName)
 	if err != nil {
 		return err
 	}
@@ -236,18 +243,18 @@ func (c *Client) RemoveRunner(ctx context.Context, repositoryFullName string, ru
 	return nil
 }
 
-func (c *Client) RemoveRunnerByName(ctx context.Context, repositoryFullName, runnerName string) (bool, error) {
+func (c *Client) RemoveRunnerByName(ctx context.Context, repositoryFullName, runnerGroup, runnerName string) (bool, error) {
 	runnerName = strings.TrimSpace(runnerName)
 	if runnerName == "" {
 		return false, nil
 	}
-	runners, err := c.ListRunners(ctx, repositoryFullName)
+	runners, err := c.ListRunners(ctx, repositoryFullName, runnerGroup)
 	if err != nil {
 		return false, err
 	}
 	for _, runner := range runners {
 		if runner.Name == runnerName {
-			return true, c.RemoveRunner(ctx, repositoryFullName, runner.ID)
+			return true, c.RemoveRunner(ctx, repositoryFullName, runnerGroup, runner.ID)
 		}
 	}
 	return false, nil
@@ -271,7 +278,7 @@ func (c *Client) ListWorkflowRunJobs(ctx context.Context, repositoryFullName str
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-		resp, err := c.http.Do(req)
+		resp, err := c.do(req, repositoryFullName)
 		if err != nil {
 			return nil, err
 		}
@@ -308,7 +315,7 @@ func (c *Client) GetWorkflowJob(ctx context.Context, repositoryFullName string, 
 	}
 	setGitHubHeaders(req)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.do(req, repositoryFullName)
 	if err != nil {
 		return WorkflowJob{}, err
 	}
@@ -323,6 +330,80 @@ func (c *Client) GetWorkflowJob(ctx context.Context, repositoryFullName string, 
 	}
 	result = "success"
 	return job, nil
+}
+
+func (c *Client) do(req *http.Request, repositoryFullName string) (*http.Response, error) {
+	if c.appAuth == nil {
+		return c.http.Do(req)
+	}
+	client, err := c.appAuth.clientForRepository(req.Context(), c.repositoryFullName(repositoryFullName))
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
+func (a *appAuthenticator) clientForRepository(ctx context.Context, repositoryFullName string) (*http.Client, error) {
+	installationID, err := a.installationID(ctx, repositoryFullName)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	transport, ok := a.transports[installationID]
+	if !ok {
+		transport = ghinstallation.NewFromAppsTransport(a.appTransport, installationID)
+		transport.BaseURL = a.baseURL
+		a.transports[installationID] = transport
+	}
+	client := *a.httpClient
+	client.Transport = transport
+	return &client, nil
+}
+
+func (a *appAuthenticator) installationID(ctx context.Context, repositoryFullName string) (int64, error) {
+	if a.staticInstallationID != 0 {
+		return a.staticInstallationID, nil
+	}
+	repositoryFullName = strings.TrimSpace(repositoryFullName)
+	if repositoryFullName == "" {
+		return 0, fmt.Errorf("repository full name is required for dynamic GitHub App installation")
+	}
+	a.mu.Lock()
+	if installationID := a.installationByRepo[repositoryFullName]; installationID != 0 {
+		a.mu.Unlock()
+		return installationID, nil
+	}
+	a.mu.Unlock()
+
+	url := fmt.Sprintf("%s/repos/%s/installation", a.baseURL, repositoryFullName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	setGitHubHeaders(req)
+	resp, err := a.appHTTP.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("github repository installation: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0, err
+	}
+	if out.ID == 0 {
+		return 0, fmt.Errorf("github repository installation response missing id")
+	}
+	a.mu.Lock()
+	a.installationByRepo[repositoryFullName] = out.ID
+	a.mu.Unlock()
+	return out.ID, nil
 }
 
 func (c *Client) cachedRegistrationToken(key string) (RegistrationToken, bool) {
@@ -350,22 +431,33 @@ func (c *Client) storeRegistrationToken(key string, token RegistrationToken) {
 	}
 }
 
-func (c *Client) registrationTokenKey(repositoryFullName string) string {
-	if c.scope == "org" {
-		return "org:" + c.org
-	}
-	return "repo:" + repositoryFullName
+func (c *Client) repositoryFullName(repositoryFullName string) string {
+	return strings.TrimSpace(repositoryFullName)
 }
 
-func (c *Client) repositoryFullName(repositoryFullName string) string {
-	repositoryFullName = strings.TrimSpace(repositoryFullName)
-	if repositoryFullName != "" {
-		return repositoryFullName
+func (c *Client) runnerTarget(repositoryFullName, runnerGroup string) (runnerTarget, error) {
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	if repositoryFullName == "" {
+		return runnerTarget{}, fmt.Errorf("repository full name is required")
 	}
-	if c.owner != "" && c.repo != "" {
-		return fmt.Sprintf("%s/%s", c.owner, c.repo)
+	owner, _, ok := strings.Cut(repositoryFullName, "/")
+	if !ok || owner == "" {
+		return runnerTarget{}, fmt.Errorf("repository full name must be owner/repo")
 	}
-	return ""
+	if strings.TrimSpace(runnerGroup) != "" {
+		return runnerTarget{
+			repositoryFullName: repositoryFullName,
+			apiPath:            "orgs/" + owner,
+			webURL:             "https://github.com/" + owner,
+			cacheKey:           "org:" + owner,
+		}, nil
+	}
+	return runnerTarget{
+		repositoryFullName: repositoryFullName,
+		apiPath:            "repos/" + repositoryFullName,
+		webURL:             "https://github.com/" + repositoryFullName,
+		cacheKey:           "repo:" + repositoryFullName,
+	}, nil
 }
 
 func nextLink(header string) string {
