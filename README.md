@@ -20,11 +20,11 @@ The config file covers:
 - E2B API settings and template
 - GitHub webhook settings plus GitHub App, PAT, or basic auth
 - worker lease / retry / concurrency settings
-- runner spec and runner-policy seed data
 
 Relative sqlite `database.url` and `github.app.private_key_file` paths are resolved from the directory containing `runnerd.yaml`.
 GitHub Enterprise Server is not currently supported; configure a GitHub.com App installation.
-Configure exactly one GitHub auth method: `github.app`, `github.token`, or `github.basic_auth`.
+Configure exactly one GitHub auth method: `github.app`, `github.token`, or `github.basic_auth`. For GitHub App auth, `github.app.installation_id` is optional. When it is omitted, runnerd resolves the installation from each job repository and caches installation transports, allowing one GitHub App to serve multiple installed accounts.
+`github.allowed_repositories` is an optional allowlist of `owner/repo` or `owner/*` patterns. Empty means all repositories that can deliver valid webhooks and match runner labels/policies are allowed.
 
 `/webhooks/github` uses GitHub HMAC signature verification. The manual management API under `/runner_requests` requires `Authorization: Bearer $ADMIN_TOKEN`.
 
@@ -49,9 +49,9 @@ docker run --rm -p 25500:25500 \
 
 Open the embedded admin console at `http://127.0.0.1:25500/admin/`. The UI is built from `ui/` with the same React, Vite, Tailwind CSS, shadcn-style components, and theme tokens used by `kubevirt-console`. It stores `ADMIN_TOKEN` in browser local storage and sends it as `Authorization: Bearer $ADMIN_TOKEN` for management API calls.
 
-The admin console manages runner requests, runner specs, runner groups, runner policies, retry actions, audit history, runner-spec match tests, and diagnostics. `runner_specs:`, `runner_groups:`, and `runner_policies:` from `runnerd.yaml` are used to initialize missing DB entries and do not overwrite later admin-managed changes on restart. For organization-scope runners, the matched runner group is also passed to GitHub runner registration as `--runnergroup`.
+The admin console manages runner requests, runner specs, runner groups, runner policies, retry actions, audit history, runner-spec match tests, and diagnostics. Runner specs, groups, and repository policies are created through the admin API/UI rather than `runnerd.yaml`. runnerd creates repository runners by default; when a matched runner spec has a GitHub runner group, it creates an organization runner for the job repository owner and passes that group as `--runnergroup`.
 
-Runner specs with `default_available: true` are globally available to installed repositories. Use runner policies only when a repository needs access to an additional/special spec.
+Create runner specs with meaningful names such as `ubuntu-24-04` or `ubuntu-24-04-large`; set each spec `template_id` to the E2B template that contains the GitHub runner image. The admin API validates that the template exists and has a ready build before saving a runner spec. Runner specs with `default_available: true` are globally available to allowed installed repositories. Use `github.allowed_repositories` to limit which repositories can use this runnerd instance, and use runner policies when a repository needs access to an additional/special spec.
 
 runnerd caches valid GitHub registration tokens per repository or organization, retries runner registration inside the sandbox, and best-effort removes the GitHub runner registration when a sandbox is stopped or recovered.
 

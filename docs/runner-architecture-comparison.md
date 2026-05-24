@@ -66,27 +66,19 @@ Fireactions 的 `Pool` 里有几个值得借鉴的点：
 4. `Pause()` / `Resume()` 可以暂停一个 pool 的扩缩容。
 5. `TriggerScale()` 用非阻塞 channel 合并多次 scale 请求。
 
-映射到当前项目，可以先做成 `runner_specs`：
+映射到当前项目，可以通过 admin API/UI 管理 `runner_specs`：
 
-```yaml
-runner_specs:
-  - name: default
-    labels: [self-hosted, e2b]
-    template_id: base-template
-    max_concurrency: 100
-    min_idle: 0
-    runner_group: default
-    allowed_repositories:
-      - owner/repo-a
-      - owner/repo-b
-  - name: large
-    labels: [self-hosted, e2b, large]
-    template_id: large-template
-    max_concurrency: 10
-    min_idle: 1
-    runner_group: large
-    allowed_repositories:
-      - owner/heavy-repo
+```json
+{
+  "name": "ubuntu-24-04",
+  "labels": ["self-hosted", "e2b"],
+  "template_id": "base-template",
+  "max_concurrency": 100,
+  "min_idle": 0,
+  "runner_group": "default",
+  "enabled": true,
+  "default_available": true
+}
 ```
 
 首版不一定要实现完整 desired replicas，但 profile 至少要承载：
@@ -153,16 +145,14 @@ ARC 的 simulator 里有 `VisibleRunnerGroups`，核心思路是：GitHub Action
 2. 大规格 runner 被普通仓库无意占用。
 3. 管理员无法表达“这个 repo 只能用 default，那个 repo 可以用 large”。
 
-建议模型：
+建议模型通过 admin API/UI 创建：
 
-```yaml
-runner_policies:
-  - repository: owner/repo-a
-    allowed_specs: [default]
-  - repository: owner/repo-b
-    allowed_specs: [default, large]
-  - repository: owner/security-sensitive
-    allowed_specs: [secure]
+```json
+{
+  "repository_full_name": "owner/heavy-repo",
+  "runner_spec_name": "ubuntu-24-04-large",
+  "enabled": true
+}
 ```
 
 匹配顺序：
@@ -291,9 +281,6 @@ worker 领取任务建议用可移植的 CAS/lease 模型：
 CREATE TABLE runner_requests (
   id TEXT PRIMARY KEY,
   source TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  owner TEXT NOT NULL,
-  repo TEXT,
   repository_full_name TEXT,
   workflow_job_id INTEGER,
   workflow_run_id INTEGER,
@@ -601,19 +588,9 @@ state:
   migrate_on_start: true
   retention_days: 90
 
-github:
-  api_base_url: https://api.github.com
-  app:
-    app_id: 123456
-    private_key_file: ./secrets/github-app.pem
-  runner_policies:
-    - repository: jimyag/*
-      runner_specs: [default]
-
 sandbox:
   api_url: http://10.210.10.32:50001
   api_key_file: ./secrets/e2b-api-key
-  domain: e2b.example.com
   create_timeout: 2m
   stop_timeout: 30s
   runner_timeout: 1h
@@ -622,29 +599,9 @@ diagnostics:
   enabled: true
   pprof_package: github.com/jimmicro/pprof
   expose_admin_summary: true
-
-runner_specs:
-  - name: default
-    labels: [self-hosted, e2b]
-    template_id: base
-    max_concurrency: 100
-    runner_group: default
-    min_idle: 0
-    enabled: true
-  - name: large
-    labels: [self-hosted, e2b, large]
-    template_id: large
-    max_concurrency: 10
-    runner_group: large
-    min_idle: 1
-    enabled: true
-
-runner_policies:
-  - repository: jimyag/template-repository
-    allowed_specs: [default]
-  - repository: jimyag/heavy-repository
-    allowed_specs: [default, large]
 ```
+
+Runner specs、runner groups 和 runner policies 不进入文件配置，由 admin API/UI 创建并持久化到状态库。
 
 ## 10. 分阶段实现建议
 

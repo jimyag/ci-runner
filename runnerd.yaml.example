@@ -15,8 +15,6 @@ admin:
 e2b:
   api_key: your-e2b-api-key
   api_url: https://api.e2b.dev
-  domain: your.e2b.domain
-  template_id: github-runner-ubuntu-24.04
   timeout_seconds: 3600
   api_timeout_seconds: 60
   create_timeout_seconds: 120
@@ -25,16 +23,17 @@ e2b:
 github:
   webhook_secret: change-me
   # GitHub.com only. GitHub Enterprise Server is not currently supported.
-  scope: repo
-  # owner/repo are optional defaults for manual requests only.
   # Webhook requests use repository.full_name from GitHub and are admitted by runner_policies.
-  owner: ""
-  repo: ""
   app:
     id: 123456
-    installation_id: 12345678
+    # Optional. Leave empty to resolve the GitHub App installation dynamically per repository.
+    # installation_id: 12345678
     # Relative paths are resolved from the directory containing runnerd.yaml.
     private_key_file: ./secrets/github-app.pem
+  # Optional repository allowlist. Empty means all repositories that installed the App are allowed.
+  # allowed_repositories:
+  #   - your-org/*
+  #   - your-org/specific-repo
   # Auth alternatives: configure exactly one of app, token, or basic_auth.
   # token: ghp_your-token
   # basic_auth:
@@ -42,9 +41,6 @@ github:
   #   password: your-token-or-password
 
 worker:
-  runner_labels:
-    - self-hosted
-    - e2b
   max_concurrent_runners: 100
   runner_idle_timeout_seconds: 300
   recovery_timeout_seconds: 120
@@ -53,23 +49,6 @@ worker:
   retry_max_delay_seconds: 300
   retry_max_attempts: 5
 
-runner_specs:
-  - name: default
-    labels: [self-hosted, e2b]
-    template_id: github-runner-ubuntu-24.04
-    max_concurrency: 100
-    min_idle: 0
-    priority: 0
-    enabled: true
-    default_available: true
-
-runner_groups:
-  - name: default
-    # For org runners, this name is passed to GitHub as --runnergroup.
-    description: Default runner specs for installed repositories.
-    spec_names: [default]
-    enabled: true
-
-runner_policies:
-  - repository: your-org/*
-    allowed_groups: [default]
+# Runner specs, runner groups, and runner policies are managed through the
+# admin API/UI. Create specs with meaningful names, for example "ubuntu-24-04",
+# and set template_id to the E2B template that contains the GitHub runner image.

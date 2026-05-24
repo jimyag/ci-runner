@@ -31,7 +31,7 @@ However, the implementation is not yet aligned with the current architecture. Th
 
 The architecture says all settings should be configurable and environment variables should no longer be supported as the primary configuration surface. Current code still loads nearly all runtime configuration from environment variables:
 
-- `internal/config/config.go:62-91` reads `HTTP_ADDR`, `STATE_DIR`, `ADMIN_TOKEN`, `E2B_API_KEY`, `E2B_API_URL`, `E2B_DOMAIN`, GitHub auth, GitHub scope, sandbox timeouts, runner labels, and concurrency from env.
+- `internal/config/config.go:62-91` reads `HTTP_ADDR`, `STATE_DIR`, `ADMIN_TOKEN`, `E2B_API_KEY`, `E2B_API_URL`, `E2B_DOMAIN`, GitHub auth, sandbox timeouts, runner labels, and concurrency from env.
 - `internal/config/config.go:96-140` validates missing values as `missing required env`.
 - `internal/config/config.go:168-180` only uses `RUNNERD_CONFIG_FILE` for seed profiles and repository policies, not for the full service config.
 

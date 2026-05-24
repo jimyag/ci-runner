@@ -29,51 +29,35 @@ admin:
 e2b:
   api_key: <e2b api key>
   api_url: <e2b api url>
-  domain: <e2b domain>
-  template_id: <template id>
 
 github:
   webhook_secret: <random webhook secret>
-  scope: repo
   app:
     id: <github app id>
-    installation_id: <installation id>
+    # 可选。不填时会按 webhook 里的 repository 动态解析 installation。
+    # installation_id: <installation id>
     private_key_file: ./secrets/github-app.pem
+  # 可选。不填表示允许所有已安装 App 且能通过 runner policy/spec 匹配的仓库。
+  # allowed_repositories:
+  #   - <repo owner>/*
+  #   - <repo owner>/<repo name>
 
 worker:
-  runner_labels: [self-hosted, e2b]
   max_concurrent_runners: 100
   recovery_timeout_seconds: 120
   lease_ttl_seconds: 300
   retry_base_delay_seconds: 15
   retry_max_delay_seconds: 300
   retry_max_attempts: 5
-
-runner_specs:
-  - name: default
-    labels: [self-hosted, e2b]
-    template_id: <template id>
-    max_concurrency: 100
-    enabled: true
-    default_available: true
-
-runner_groups:
-  - name: default
-    spec_names: [default]
-    enabled: true
-
-runner_policies:
-  - repository: <repo owner>/<repo name>
-    allowed_groups: [default]
 ```
 
-组织级 runner 只要把 `github.scope` 改成 `org`，并填写 `github.org`。
+Runner spec、runner group 和 repository policy 不在 `runnerd.yaml` 中配置；服务启动后通过后台页面或 admin API 创建。spec 名称建议使用有意义的名字，例如 `ubuntu-24-04`，`template_id` 填对应的 E2B template ID。保存 runner spec 前，admin API 会验证该 template 存在且有 ready build。
 
 ## 2. 配置 GitHub 鉴权
 
 推荐使用 GitHub App。PAT token 和 basic auth 也支持，主要用于本地验证或已有凭据场景。
 
-GitHub App 需要能调用对应 scope 的 runner registration token API。Repository runner 需要目标仓库的 administration 权限；organization runner 需要组织级 self-hosted runner 管理权限。
+GitHub App 需要能调用 runner registration token API。Repository runner 需要目标仓库的 administration 权限；使用 GitHub runner group 时会创建 organization runner，需要组织级 self-hosted runner 管理权限。
 
 建议流程：
 
@@ -93,19 +77,18 @@ GitHub App 需要能调用对应 scope 的 runner registration token API。Repos
    - 点 `Install App`
    - 选择目标 owner
    - 选择要授权的仓库
-8. 记录三个值：
+8. 记录这些值：
    - App ID
-   - Installation ID
+   - Installation ID（可选；不配置时 runnerd 会按仓库动态解析）
    - private key 文件路径
 
 对应填入 `runnerd.yaml`：
 
 ```yaml
 github:
-  scope: repo
   app:
     id: <app id>
-    installation_id: <installation id>
+    # installation_id: <installation id>
     private_key_file: ./secrets/github-app.pem
 ```
 
@@ -114,7 +97,6 @@ PAT 示例：
 ```yaml
 github:
   webhook_secret: <random webhook secret>
-  scope: repo
   token: <github token>
 ```
 
@@ -123,13 +105,12 @@ Basic auth 示例：
 ```yaml
 github:
   webhook_secret: <random webhook secret>
-  scope: repo
   basic_auth:
     username: <github username>
     password: <token or password>
 ```
 
-repo scope 下不需要固定 `owner/repo`；webhook 会使用 payload 里的 `repository.full_name` 创建对应 repository runner。`runner_specs.default_available: true` 的规格对所有仓库默认可用；`runner_policies` 只需要用于给某个仓库或仓库通配符追加特殊 spec，例如 `jimyag/*` 或 `jimyag/template-repository`。如果是 organization runner，把 `scope` 改成 `org`，并填写 `org`。org scope 下匹配到的 `runner_group` 会作为 GitHub runner registration 的 `--runnergroup` 传入。
+不需要固定全局 repo/org 模式；webhook 会使用 payload 里的 `repository.full_name`。默认创建 repository runner；如果匹配到的 runner spec 设置了 GitHub `runner_group`，runnerd 会按该仓库 owner 创建 organization runner，并把 `runner_group` 作为 GitHub runner registration 的 `--runnergroup` 传入。`runner_specs.default_available: true` 的规格对所有仓库默认可用；`runner_policies` 只需要用于给某个仓库或仓库通配符追加特殊 spec，例如 `jimyag/*` 或 `jimyag/template-repository`。
 
 ## 3. 启动服务
 
@@ -153,13 +134,22 @@ http://127.0.0.1:25500/admin/
 
 后台页面源码在 `ui/`，使用和 `kubevirt-console` 相同的 React、Vite、Tailwind CSS、shadcn 风格组件和主题 CSS。`task build` 会先执行 `task ui-build`，把前端产物写入 `internal/server/admin/` 后再编译 `runnerd`。管理面现在包含 runners、runner specs、runner policies、retry、audit、label match test 和 diagnostics 页面。
 
+先创建一个默认 runner spec：
+
+```bash
+curl -fsS -X POST http://127.0.0.1:25500/runner_specs \
+  -H "authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'content-type: application/json' \
+  -d '{"name":"ubuntu-24-04","labels":["self-hosted","e2b"],"template_id":"<template id>","max_concurrency":100,"enabled":true,"default_available":true}' | jq
+```
+
 手动创建一个 runner：
 
 ```bash
 curl -fsS -X POST http://127.0.0.1:25500/runner_requests \
   -H "authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'content-type: application/json' \
-  -d '{"id":"manual-001","repository_full_name":"<owner>/<repo>","runner_spec_name":"default"}' | jq
+  -d '{"id":"manual-001","repository_full_name":"<owner>/<repo>","runner_spec_name":"ubuntu-24-04"}' | jq
 ```
 
 查看状态：
@@ -203,7 +193,7 @@ curl -fsS -H "authorization: Bearer ${ADMIN_TOKEN}" http://127.0.0.1:25500/diagn
 重点看：
 
 - `github.auth_mode` 是否是 `app`
-- `github.installation_id` 是否符合预期
+- 如果配置了静态 installation，`github.installation_id` 是否符合预期；动态 installation 模式下这里可以是 `0`
 - `state.database` 是否指向你的 `runnerd.yaml` 里配置的数据库
 
 ## 5. 暴露 Webhook 地址
