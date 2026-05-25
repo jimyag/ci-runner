@@ -32,7 +32,7 @@ For an isolated development tag:
 npm run build:dev
 ```
 
-Both production and development template builds request `8` vCPUs and `4096` MiB of memory. New sandboxes inherit those resources from the rebuilt template.
+Both production and development template builds request `8` vCPUs and `8192` MiB of memory. New sandboxes inherit those resources from the rebuilt template.
 
 The build prints a template ID and template name. Use the production template name or ID as:
 
