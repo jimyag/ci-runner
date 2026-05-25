@@ -44,6 +44,9 @@ func TestLabelsUnmarshalAndMatch(t *testing.T) {
 	if !LabelsMatch(event.WorkflowJob.Labels, []string{"self-hosted", "e2b"}) {
 		t.Fatalf("expected labels to match: %#v", event.WorkflowJob.Labels)
 	}
+	if !LabelsMatch([]string{"e2b"}, []string{"self-hosted", "e2b", "las-sandbox"}) {
+		t.Fatal("expected runner labels to satisfy a subset of requested labels")
+	}
 	if LabelsMatch(event.WorkflowJob.Labels, []string{"self-hosted", "linux"}) {
 		t.Fatalf("expected labels not to match")
 	}

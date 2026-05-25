@@ -196,6 +196,27 @@ func TestDefaultAvailableProfileMatchesWithoutRepositoryPolicy(t *testing.T) {
 	}
 }
 
+func TestMatchProfileAllowsRunnerSpecWithAdditionalLabels(t *testing.T) {
+	store := New(t.TempDir())
+	if _, err := store.UpsertProfile(RunnerProfile{
+		Name:             "default",
+		Labels:           []string{"self-hosted", "e2b", "las-sandbox", "github-runner-ubuntu-24-04"},
+		TemplateID:       "base",
+		MaxConcurrency:   10,
+		Enabled:          true,
+		DefaultAvailable: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	match, err := store.MatchProfile("owner/any-repo", []string{"github-runner-ubuntu-24-04"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if match.Profile == nil || match.Profile.Name != "default" {
+		t.Fatalf("expected default profile match, got %#v", match.Profile)
+	}
+}
+
 func TestRunnerGroupPolicyMatchesGroupSpecs(t *testing.T) {
 	store := New(t.TempDir())
 	if _, err := store.UpsertProfile(RunnerProfile{
