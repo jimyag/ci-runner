@@ -11,6 +11,7 @@ import (
 	_ "github.com/jimmicro/pprof"
 	"github.com/jimyag/e2b-github-runner/internal/config"
 	"github.com/jimyag/e2b-github-runner/internal/github"
+	"github.com/jimyag/e2b-github-runner/internal/redact"
 	"github.com/jimyag/e2b-github-runner/internal/sandboxrunner"
 	"github.com/jimyag/e2b-github-runner/internal/server"
 	"github.com/jimyag/e2b-github-runner/internal/state"
@@ -79,7 +80,7 @@ func main() {
 		IdleTimeout:       cfg.HTTPIdleTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
-	logger.Info("starting server", "addr", cfg.HTTPAddr, "state_backend", cfg.StateBackend, "state_database_url", cfg.StateDatabaseURL)
+	logger.Info("starting server", "addr", cfg.HTTPAddr, "state_backend", cfg.StateBackend, "state_database_url", redact.DatabaseURL(cfg.StateDatabaseURL))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)

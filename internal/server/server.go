@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -26,6 +25,7 @@ import (
 	"github.com/jimyag/e2b-github-runner/internal/config"
 	"github.com/jimyag/e2b-github-runner/internal/github"
 	"github.com/jimyag/e2b-github-runner/internal/metrics"
+	"github.com/jimyag/e2b-github-runner/internal/redact"
 	"github.com/jimyag/e2b-github-runner/internal/sandboxrunner"
 	"github.com/jimyag/e2b-github-runner/internal/state"
 )
@@ -1280,7 +1280,7 @@ func (s *Server) handleDiagnosticsPprof(w http.ResponseWriter, r *http.Request) 
 		"pprof": out,
 		"state": map[string]any{
 			"backend":  s.cfg.StateBackend,
-			"database": redactDatabaseURL(s.cfg.StateDatabaseURL),
+			"database": redact.DatabaseURL(s.cfg.StateDatabaseURL),
 		},
 		"github": map[string]any{
 			"auth_mode":       s.cfg.GitHubAuthMode(),
@@ -1292,17 +1292,6 @@ func (s *Server) handleDiagnosticsPprof(w http.ResponseWriter, r *http.Request) 
 		},
 		"recent_failures": failures,
 	})
-}
-
-func redactDatabaseURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" {
-		return raw
-	}
-	if u.User != nil {
-		u.User = url.User("xxxxx")
-	}
-	return u.String()
 }
 
 func intValue(value *int) int {
@@ -1763,7 +1752,14 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 		if cleanupErr := s.cleanupSandboxAfterExit(id, st); cleanupErr != nil {
 			st.Error = st.Error + "; cleanup sandbox: " + cleanupErr.Error()
 		}
-		s.cleanupGitHubRunner(context.Background(), st)
+		if cleanupErr := s.cleanupGitHubRunner(context.Background(), st); cleanupErr != nil {
+			if s.scheduleCleanupRetry(&st, cleanupErr) {
+				s.writeStateOrLog(id, st, "schedule github runner cleanup retry")
+				s.refreshMetrics()
+				return
+			}
+			st.Error = appendError(st.Error, "github runner cleanup: "+cleanupErr.Error())
+		}
 		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
 		s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), "failure")
 		s.writeStateOrLog(id, st, "write failed exit state")
@@ -1787,7 +1783,17 @@ func (s *Server) runnerExited(id string, result sandboxrunner.ExitResult, err er
 		st.Status = state.StatusCompleted
 		st.CompletedAt = time.Now().UTC()
 	}
-	s.cleanupGitHubRunner(context.Background(), st)
+	if cleanupErr := s.cleanupGitHubRunner(context.Background(), st); cleanupErr != nil {
+		if s.scheduleCleanupRetry(&st, cleanupErr) {
+			s.writeStateOrLog(id, st, "schedule github runner cleanup retry")
+			s.refreshMetrics()
+			return
+		}
+		st.Status = state.StatusFailed
+		st.FailureStage = "cleanup"
+		st.FailureReason = "github_runner_cleanup_failed"
+		st.Error = appendError(st.Error, "github runner cleanup: "+cleanupErr.Error())
+	}
 	if st.Status == state.StatusFailed {
 		metrics.RecordWorkflowFailure(st.RepositoryFullName, "unknown", workflowJobName(st, github.WorkflowJob{}), st.ProfileName, st.FailureStage, st.FailureReason)
 		s.recordWorkflowRunDuration(st, "", workflowJobName(st, github.WorkflowJob{}), "failure")
@@ -1843,7 +1849,18 @@ func (s *Server) recoverRunner(ctx context.Context, id string) error {
 			}
 		}
 	}
-	s.cleanupGitHubRunner(ctx, st)
+	if cleanupErr := s.cleanupGitHubRunner(ctx, st); cleanupErr != nil {
+		if s.scheduleCleanupRetry(&st, cleanupErr) {
+			s.recordAudit("recovery", "runner.cleanup_retry_scheduled", "runner_request", st.ID, map[string]any{"error": cleanupErr.Error(), "next_retry_at": st.NextRetryAt})
+			return s.store.WriteState(st)
+		}
+		st.Status = state.StatusFailed
+		st.FailureStage = "recovery"
+		st.FailureReason = "cleanup_failed"
+		st.Error = "recover cleanup github runner: " + cleanupErr.Error()
+		s.recordAudit("recovery", "runner.recovery_failed", "runner_request", st.ID, map[string]any{"error": st.Error})
+		return s.store.WriteState(st)
+	}
 	st.Status = state.StatusFailed
 	st.FailureStage = "recovery"
 	st.FailureReason = "interrupted_runner"
@@ -1939,10 +1956,42 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 			}
 		}
 	}
-	s.cleanupGitHubRunner(ctx, st)
-	st.Status = state.StatusCompleted
-	st.CompletedAt = time.Now().UTC()
-	st.Error = ""
+	if cleanupErr := s.cleanupGitHubRunner(ctx, st); cleanupErr != nil {
+		if s.scheduleCleanupRetry(&st, cleanupErr) {
+			if writeErr := s.store.WriteState(st); writeErr != nil {
+				return state.RunnerState{}, false, fmt.Errorf("schedule github runner cleanup retry: %v; write stopping state: %w", cleanupErr, writeErr)
+			}
+			st.Version++
+			s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("github runner cleanup retry scheduled for %s: %s\n", st.NextRetryAt.Format(time.RFC3339), cleanupErr)))
+			s.logger.Info("github runner cleanup retry scheduled", "id", id, "runner_name", st.RunnerName, "next_retry_at", st.NextRetryAt, "error", cleanupErr)
+			s.refreshMetrics()
+			return st, false, nil
+		}
+		st.Status = state.StatusFailed
+		st.FailureStage = "cleanup"
+		st.FailureReason = "github_runner_cleanup_failed"
+		st.Error = cleanupErr.Error()
+		if writeErr := s.store.WriteState(st); writeErr != nil {
+			return state.RunnerState{}, false, fmt.Errorf("cleanup github runner: %v; write failed state: %w", cleanupErr, writeErr)
+		}
+		metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "failed")
+		s.refreshMetrics()
+		return st, false, cleanupErr
+	}
+	if st.FailureStage != "" && st.FailureStage != "cleanup" {
+		st.Status = state.StatusFailed
+		st.FailedAt = time.Now().UTC()
+	} else {
+		st.Status = state.StatusCompleted
+		st.CompletedAt = time.Now().UTC()
+		st.FailureStage = ""
+		st.FailureReason = ""
+		st.Error = ""
+	}
+	st.NextRetryAt = time.Time{}
+	st.LastErrorCode = ""
+	st.LastErrorMessage = ""
+	st.LastErrorRetryable = false
 	if err := s.store.WriteState(st); err != nil {
 		return state.RunnerState{}, false, err
 	}
@@ -1988,12 +2037,27 @@ func (s *Server) failAndStopRunner(ctx context.Context, id, stage, reason, messa
 			return
 		}
 	}
-	s.cleanupGitHubRunner(ctx, st)
+	if cleanupErr := s.cleanupGitHubRunner(ctx, st); cleanupErr != nil {
+		if s.scheduleCleanupRetry(&st, cleanupErr) {
+			s.writeStateOrLog(id, st, "schedule github runner cleanup retry")
+			s.refreshMetrics()
+			return
+		}
+		st.FailureStage = "cleanup"
+		st.FailureReason = "github_runner_cleanup_failed"
+		st.Error = appendError(message, "github runner cleanup: "+cleanupErr.Error())
+	}
 	st.Status = state.StatusFailed
 	st.FailedAt = time.Now().UTC()
-	st.FailureStage = stage
-	st.FailureReason = reason
-	st.Error = message
+	if st.FailureStage == "" {
+		st.FailureStage = stage
+	}
+	if st.FailureReason == "" {
+		st.FailureReason = reason
+	}
+	if st.Error == "" {
+		st.Error = message
+	}
 	st.LeaseOwner = ""
 	st.LeaseExpiresAt = time.Time{}
 	s.writeStateOrLog(id, st, "write forced failed state")
@@ -2003,9 +2067,13 @@ func (s *Server) failAndStopRunner(ctx context.Context, id, stage, reason, messa
 	s.refreshMetrics()
 }
 
-func (s *Server) cleanupGitHubRunner(ctx context.Context, st state.RunnerState) {
+func (s *Server) cleanupGitHubRunner(ctx context.Context, st state.RunnerState) error {
 	if strings.TrimSpace(st.RunnerName) == "" {
-		return
+		return nil
+	}
+	if strings.TrimSpace(st.RepositoryFullName) == "" {
+		s.logger.Info("github runner cleanup skipped because repository is empty", "id", st.ID, "runner_name", st.RunnerName)
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -2014,16 +2082,17 @@ func (s *Server) cleanupGitHubRunner(ctx context.Context, st state.RunnerState) 
 		s.logger.Warn("github runner cleanup failed", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName, "error", err)
 		s.store.AppendLog(st.ID, "control.log", []byte("github runner cleanup failed: "+err.Error()+"\n"))
 		metrics.RecordRunnerCleanup(st.ProfileName, "error")
-		return
+		return err
 	}
 	if removed {
 		s.logger.Info("github runner registration removed", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName)
 		s.store.AppendLog(st.ID, "control.log", []byte("github runner registration removed\n"))
 		metrics.RecordRunnerCleanup(st.ProfileName, "removed")
-		return
+		return nil
 	}
 	s.logger.Info("github runner registration already absent", "id", st.ID, "runner_name", st.RunnerName, "repository", st.RepositoryFullName)
 	metrics.RecordRunnerCleanup(st.ProfileName, "absent")
+	return nil
 }
 
 func (s *Server) writeStateOrLog(id string, st state.RunnerState, msg string) {
@@ -2205,6 +2274,37 @@ func (s *Server) scheduleStopRetry(st *state.RunnerState, err error) bool {
 	st.Error = err.Error()
 	st.NextRetryAt = s.nextRetryAt(st.RetryCount, time.Now().UTC())
 	return true
+}
+
+func (s *Server) scheduleCleanupRetry(st *state.RunnerState, err error) bool {
+	code, retryable := classifyRetryableError("github_cleanup", err)
+	if !retryable || st.RetryCount >= s.cfg.RetryMaxAttempts {
+		return false
+	}
+	st.RetryCount++
+	st.Status = state.StatusStopping
+	if st.FailureStage == "" {
+		st.FailureStage = "cleanup"
+		st.FailureReason = code
+		st.Error = err.Error()
+	}
+	st.LastErrorCode = code
+	st.LastErrorMessage = err.Error()
+	st.LastErrorRetryable = true
+	st.NextRetryAt = s.nextRetryAt(st.RetryCount, time.Now().UTC())
+	return true
+}
+
+func appendError(current, extra string) string {
+	current = strings.TrimSpace(current)
+	extra = strings.TrimSpace(extra)
+	if current == "" {
+		return extra
+	}
+	if extra == "" {
+		return current
+	}
+	return current + "; " + extra
 }
 
 func (s *Server) profileAtCapacity(profileName string) (bool, error) {

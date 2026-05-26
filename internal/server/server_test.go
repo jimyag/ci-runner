@@ -761,10 +761,129 @@ func TestRecoverStopsActiveRunnerState(t *testing.T) {
 	}
 }
 
+func TestStopRunnerSchedulesGitHubCleanupRetry(t *testing.T) {
+	var listCalls int
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners":
+			listCalls++
+			if listCalls == 1 {
+				http.Error(w, "temporary github failure", http.StatusInternalServerError)
+				return
+			}
+			w.Write([]byte(`{"runners":[{"id":99,"name":"e2b-cleanup-retry","status":"offline"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/actions/runners/99":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "cleanup-retry",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-cleanup-retry",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusRunning
+	st.SandboxID = "sb-cleanup-retry"
+	st.ProcessPID = 42
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	got, stopped, err := srv.stopRunner(t.Context(), "cleanup-retry", github.WorkflowJob{})
+	if err != nil {
+		t.Fatalf("stopRunner should schedule retry instead of failing immediately: %v", err)
+	}
+	if stopped {
+		t.Fatal("stopRunner reported stopped even though GitHub cleanup retry was scheduled")
+	}
+	if got.Status != state.StatusStopping || got.FailureStage != "cleanup" || !got.LastErrorRetryable || got.NextRetryAt.IsZero() {
+		t.Fatalf("expected stopping cleanup retry state, got %#v", got)
+	}
+
+	got.NextRetryAt = time.Now().UTC().Add(-time.Second)
+	if err := store.WriteState(got); err != nil {
+		t.Fatal(err)
+	}
+	got, stopped, err = srv.stopRunner(t.Context(), "cleanup-retry", github.WorkflowJob{})
+	if err != nil {
+		t.Fatalf("stopRunner retry should complete after GitHub cleanup succeeds: %v", err)
+	}
+	if !stopped || got.Status != state.StatusCompleted {
+		t.Fatalf("expected cleanup retry to complete runner, stopped=%v state=%#v", stopped, got)
+	}
+	if got.FailureStage != "" || got.LastErrorMessage != "" || !got.NextRetryAt.IsZero() {
+		t.Fatalf("expected cleanup retry metadata to be cleared after success, got %#v", got)
+	}
+}
+
+func TestStopRunnerPreservesFailureAfterCleanupRetrySuccess(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners":
+			w.Write([]byte(`{"runners":[{"id":99,"name":"e2b-failed-cleanup","status":"offline"}]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/repos/o/r/actions/runners/99":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "failed-cleanup",
+		Source:             "test",
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-failed-cleanup",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusStopping
+	st.SandboxID = "sb-failed-cleanup"
+	st.ProcessPID = 42
+	st.FailureStage = "sandbox_timeout"
+	st.FailureReason = "timeout"
+	st.Error = "runner exceeded sandbox timeout"
+	st.NextRetryAt = time.Now().UTC().Add(-time.Second)
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	got, stopped, err := srv.stopRunner(t.Context(), "failed-cleanup", github.WorkflowJob{})
+	if err != nil {
+		t.Fatalf("stopRunner should finish cleanup for failed runner: %v", err)
+	}
+	if !stopped || got.Status != state.StatusFailed {
+		t.Fatalf("expected failed terminal state after cleanup, stopped=%v state=%#v", stopped, got)
+	}
+	if got.FailureStage != "sandbox_timeout" || got.FailureReason != "timeout" {
+		t.Fatalf("expected original failure metadata to be preserved, got %#v", got)
+	}
+}
+
 func TestSweeperMarksTimedOutRunningRunnerFailed(t *testing.T) {
 	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners" {
+		if r.Method == http.MethodGet && (r.URL.Path == "/repos/o/r/actions/runners" || r.URL.Path == "/orgs/o/actions/runners") {
 			w.Write([]byte(`{"runners":[]}`))
 			return
 		}
@@ -1230,6 +1349,16 @@ func TestSweeperRespectsStoppingRetryBackoff(t *testing.T) {
 }
 
 func TestSweeperStopsIdleRunnerThatNeverAcceptedJob(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && (r.URL.Path == "/repos/o/r/actions/runners" || r.URL.Path == "/orgs/o/actions/runners") {
+			w.Write([]byte(`{"runners":[]}`))
+			return
+		}
+		t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+	}))
+	defer ghServer.Close()
+
 	store := state.New(t.TempDir())
 	if _, st, err := store.CreateRequest(state.RunnerRequest{
 		ID:                 "idle-runner",
@@ -1251,7 +1380,7 @@ func TestSweeperStopsIdleRunnerThatNeverAcceptedJob(t *testing.T) {
 		}
 	}
 	fake := &fakeSandbox{}
-	srv := newTestServerWithLimit(t, store, "http://example.test", fake, 10)
+	srv := newTestServerWithLimit(t, store, ghServer.URL, fake, 10)
 	srv.cfg.RunnerIdleTimeout = time.Minute
 	srv.sweepOnce(t.Context())
 	if fake.stoppedCount() != 1 {

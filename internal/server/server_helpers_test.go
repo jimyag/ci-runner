@@ -11,6 +11,7 @@ import (
 
 	"github.com/jimyag/e2b-github-runner/internal/config"
 	"github.com/jimyag/e2b-github-runner/internal/github"
+	"github.com/jimyag/e2b-github-runner/internal/redact"
 	"github.com/jimyag/e2b-github-runner/internal/sandboxrunner"
 	"github.com/jimyag/e2b-github-runner/internal/state"
 )
@@ -764,7 +765,7 @@ func TestDiagnosticsPprofEndpointReturnsJSON(t *testing.T) {
 }
 
 func TestRedactDatabaseURLRemovesCredentials(t *testing.T) {
-	got := redactDatabaseURL("postgres://runner:secret@example.test/runnerd?sslmode=disable")
+	got := redact.DatabaseURL("postgres://runner:secret@example.test/runnerd?sslmode=disable")
 	if strings.Contains(got, "runner:") || strings.Contains(got, "secret") {
 		t.Fatalf("database URL leaked credentials: %s", got)
 	}
@@ -980,8 +981,18 @@ func TestCleanupSandboxAfterExitNoopWhenNoSandboxID(t *testing.T) {
 // ---------- runnerExited (clean exit) ----------
 
 func TestRunnerExitedWithExitCode0TransitionsToCompleted(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners" {
+			w.Write([]byte(`{"runners":[]}`))
+			return
+		}
+		t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+	}))
+	defer ghServer.Close()
+
 	store := state.New(t.TempDir())
-	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, ghServer.URL, &fakeSandbox{})
 
 	_, st, err := store.CreateRequest(state.RunnerRequest{
 		ID:                 "exited-clean",
@@ -1012,8 +1023,18 @@ func TestRunnerExitedWithExitCode0TransitionsToCompleted(t *testing.T) {
 }
 
 func TestRunnerExitedWithNonZeroExitCodeTransitionsToFailed(t *testing.T) {
+	ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/repos/o/r/actions/runners" {
+			w.Write([]byte(`{"runners":[]}`))
+			return
+		}
+		t.Fatalf("unexpected github request: %s %s", r.Method, r.URL.String())
+	}))
+	defer ghServer.Close()
+
 	store := state.New(t.TempDir())
-	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+	srv := newTestServer(t, store, ghServer.URL, &fakeSandbox{})
 
 	_, st, err := store.CreateRequest(state.RunnerRequest{
 		ID:                 "exited-nonzero",
