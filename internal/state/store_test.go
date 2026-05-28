@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -133,6 +134,35 @@ func TestListStatesAndActiveCount(t *testing.T) {
 	}
 	if active != 1 {
 		t.Fatalf("expected 1 active runner, got %d", active)
+	}
+}
+
+func TestListStatesPage(t *testing.T) {
+	store := New(t.TempDir())
+	for i := 0; i < 5; i++ {
+		if _, _, err := store.CreateRequest(RunnerRequest{
+			ID:         fmt.Sprintf("runner-%d", i),
+			Source:     "test",
+			Labels:     []string{"self-hosted"},
+			RunnerName: fmt.Sprintf("e2b-runner-%d", i),
+			CreatedAt:  time.Unix(int64(i), 0).UTC(),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	paged, total, err := store.ListStatesPage(2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 {
+		t.Fatalf("total = %d, want 5", total)
+	}
+	if len(paged) != 2 {
+		t.Fatalf("len = %d, want 2", len(paged))
+	}
+	if paged[0].ID != "runner-3" || paged[1].ID != "runner-2" {
+		t.Fatalf("unexpected page order: %#v", []string{paged[0].ID, paged[1].ID})
 	}
 }
 

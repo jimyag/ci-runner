@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -227,6 +228,62 @@ func TestManagementEndpointsRequireAdminAuth(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected authorized request, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListRunnerRequestsIsPaginated(t *testing.T) {
+	store := state.New(t.TempDir())
+	for i := 0; i < 105; i++ {
+		if _, _, err := store.CreateRequest(state.RunnerRequest{
+			ID:         fmt.Sprintf("runner-%03d", i),
+			Source:     "test",
+			Labels:     []string{"self-hosted"},
+			RunnerName: fmt.Sprintf("e2b-runner-%03d", i),
+			CreatedAt:  time.Unix(int64(i), 0).UTC(),
+		}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
+
+	req := adminRequest(http.MethodGet, "/runner_requests", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var states []state.RunnerState
+	if err := json.NewDecoder(rec.Body).Decode(&states); err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 100 {
+		t.Fatalf("default page len = %d, want 100", len(states))
+	}
+	if rec.Header().Get("X-Total-Count") != "105" {
+		t.Fatalf("X-Total-Count = %q, want 105", rec.Header().Get("X-Total-Count"))
+	}
+	if rec.Header().Get("X-Limit") != "100" || rec.Header().Get("X-Offset") != "0" {
+		t.Fatalf("unexpected pagination headers: limit=%q offset=%q", rec.Header().Get("X-Limit"), rec.Header().Get("X-Offset"))
+	}
+	if !strings.Contains(rec.Header().Get("Link"), `rel="next"`) {
+		t.Fatalf("expected next link, got %q", rec.Header().Get("Link"))
+	}
+
+	req = adminRequest(http.MethodGet, "/runner_requests?limit=10&offset=100", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	states = nil
+	if err := json.NewDecoder(rec.Body).Decode(&states); err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 5 {
+		t.Fatalf("second page len = %d, want 5", len(states))
+	}
+	if !strings.Contains(rec.Header().Get("Link"), `rel="prev"`) {
+		t.Fatalf("expected prev link, got %q", rec.Header().Get("Link"))
 	}
 }
 

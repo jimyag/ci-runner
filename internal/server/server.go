@@ -92,6 +92,11 @@ var adminAssets embed.FS
 
 const runnerJobStartedMarker = "__runner_job_started__"
 
+const (
+	defaultRunnerRequestListLimit = 100
+	maxRunnerRequestListLimit     = 500
+)
+
 func New(cfg config.Config, store state.Store, gh *github.Client, sandbox sandboxrunner.Service, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
@@ -752,12 +757,17 @@ func (s *Server) handleListRunners(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdminAuth(w, r) {
 		return
 	}
-	s.refreshMetrics()
-	states, err := s.store.ListStates()
+	limit, offset, err := parsePagination(r, defaultRunnerRequestListLimit, maxRunnerRequestListLimit)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	states, total, err := s.store.ListStatesPage(limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	writePaginationHeaders(w, r, total, limit, offset)
 	writeJSON(w, http.StatusOK, states)
 }
 
@@ -2498,6 +2508,59 @@ func isSandboxGone(err error) bool {
 	return strings.Contains(msg, "status 404") ||
 		strings.Contains(msg, "Sandbox can't be resumed") ||
 		strings.Contains(msg, "SandboxNotFound")
+}
+
+func parsePagination(r *http.Request, defaultLimit, maxLimit int) (int, int, error) {
+	q := r.URL.Query()
+	limit := defaultLimit
+	if raw := strings.TrimSpace(q.Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			return 0, 0, fmt.Errorf("limit must be a positive integer")
+		}
+		limit = parsed
+	}
+	if maxLimit > 0 && limit > maxLimit {
+		limit = maxLimit
+	}
+	offset := 0
+	if raw := strings.TrimSpace(q.Get("offset")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			return 0, 0, fmt.Errorf("offset must be a non-negative integer")
+		}
+		offset = parsed
+	}
+	return limit, offset, nil
+}
+
+func writePaginationHeaders(w http.ResponseWriter, r *http.Request, total int64, limit, offset int) {
+	w.Header().Set("X-Total-Count", strconv.FormatInt(total, 10))
+	w.Header().Set("X-Limit", strconv.Itoa(limit))
+	w.Header().Set("X-Offset", strconv.Itoa(offset))
+	links := make([]string, 0, 2)
+	if offset > 0 {
+		prevOffset := offset - limit
+		if prevOffset < 0 {
+			prevOffset = 0
+		}
+		links = append(links, fmt.Sprintf("<%s>; rel=\"prev\"", pageURL(r, limit, prevOffset)))
+	}
+	if int64(offset+limit) < total {
+		links = append(links, fmt.Sprintf("<%s>; rel=\"next\"", pageURL(r, limit, offset+limit)))
+	}
+	if len(links) > 0 {
+		w.Header().Set("Link", strings.Join(links, ", "))
+	}
+}
+
+func pageURL(r *http.Request, limit, offset int) string {
+	q := r.URL.Query()
+	q.Set("limit", strconv.Itoa(limit))
+	q.Set("offset", strconv.Itoa(offset))
+	u := *r.URL
+	u.RawQuery = q.Encode()
+	return u.RequestURI()
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

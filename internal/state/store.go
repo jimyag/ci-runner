@@ -147,6 +147,7 @@ type Store interface {
 	ReadState(id string) (RunnerState, error)
 	WriteState(st RunnerState) error
 	ListStates() ([]RunnerState, error)
+	ListStatesPage(limit, offset int) ([]RunnerState, int64, error)
 	ActiveCount() (int, error)
 	InFlightCount() (int, error)
 	ActiveCountForProfile(name string) (int, error)
@@ -478,6 +479,32 @@ func (s *DBStore) ListStates() ([]RunnerState, error) {
 		states = append(states, recordToState(record))
 	}
 	return states, nil
+}
+
+func (s *DBStore) ListStatesPage(limit, offset int) ([]RunnerState, int64, error) {
+	db, err := s.dbOrEnsure()
+	if err != nil {
+		return nil, 0, err
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int64
+	if err := db.Model(&runnerRequestRecord{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var records []runnerRequestRecord
+	if err := db.Order("queued_at DESC").Limit(limit).Offset(offset).Find(&records).Error; err != nil {
+		return nil, 0, err
+	}
+	states := make([]RunnerState, 0, len(records))
+	for _, record := range records {
+		states = append(states, recordToState(record))
+	}
+	return states, total, nil
 }
 
 func (s *DBStore) ActiveCount() (int, error) {
