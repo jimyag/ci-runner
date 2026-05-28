@@ -373,6 +373,94 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 			}
 		}
 	}
+	s.reconcileMismatchedCompletedJobs(ctx)
+}
+
+func (s *Server) reconcileMismatchedCompletedJobs(ctx context.Context) {
+	states, err := s.store.ListMismatchedCompletedStates(50)
+	if err != nil {
+		s.logger.Error("list mismatched completed states for reconciler", "error", err)
+		return
+	}
+	for _, st := range states {
+		unlock := s.lockRunner(st.ID)
+		current, readErr := s.store.ReadState(st.ID)
+		if readErr != nil {
+			unlock()
+			s.logger.Error("read mismatched completed state", "id", st.ID, "error", readErr)
+			continue
+		}
+		if current.Status != state.StatusCompleted || current.WorkflowJobID == 0 || current.AssignedJobID == 0 || current.WorkflowJobID == current.AssignedJobID {
+			unlock()
+			continue
+		}
+		observed := github.WorkflowJob{ID: current.AssignedJobID, Name: current.AssignedJobName}
+		requeued, next, requeueErr := s.requeueMismatchedWorkflowJob(ctx, current, observed)
+		unlock()
+		if requeueErr != nil {
+			s.logger.Error("requeue mismatched completed workflow job", "id", st.ID, "workflow_job_id", current.WorkflowJobID, "assigned_job_id", current.AssignedJobID, "error", requeueErr)
+			continue
+		}
+		if requeued {
+			s.logger.Warn("reconciler requeued mismatched completed workflow job", "id", next.ID, "workflow_job_id", next.WorkflowJobID, "assigned_job_id", current.AssignedJobID, "repository", next.RepositoryFullName)
+			s.refreshMetrics()
+		}
+	}
+}
+
+func (s *Server) requeueMismatchedWorkflowJob(ctx context.Context, st state.RunnerState, observed github.WorkflowJob) (bool, state.RunnerState, error) {
+	queued, err := s.originalWorkflowJobQueued(ctx, st)
+	if err != nil {
+		s.logger.Warn("original workflow job status check failed; requeueing mismatched request for retry", "id", st.ID, "workflow_job_id", st.WorkflowJobID, "assigned_job_id", observed.ID, "error", err)
+		queued = true
+	}
+	if !queued {
+		next := st
+		next.AssignedJobID = 0
+		next.AssignedJobName = ""
+		if err := s.store.WriteState(next); err != nil {
+			return false, state.RunnerState{}, fmt.Errorf("write mismatched workflow job inspection: %w", err)
+		}
+		s.store.AppendLog(st.ID, "control.log", []byte(fmt.Sprintf("runner completed different workflow job %d; original workflow job %d is no longer queued\n", observed.ID, st.WorkflowJobID)))
+		return false, next, nil
+	}
+	next := st
+	next.Status = state.StatusQueued
+	next.SandboxID = ""
+	next.ProcessPID = 0
+	next.AssignedJobID = 0
+	next.AssignedJobName = ""
+	next.Error = ""
+	next.FailureStage = ""
+	next.FailureReason = ""
+	next.LastErrorCode = ""
+	next.LastErrorMessage = ""
+	next.LastErrorRetryable = false
+	next.LeaseOwner = ""
+	next.LeaseExpiresAt = time.Time{}
+	next.NextRetryAt = time.Time{}
+	next.CreatingAt = time.Time{}
+	next.RunningAt = time.Time{}
+	next.StoppingAt = time.Time{}
+	next.CompletedAt = time.Time{}
+	next.FailedAt = time.Time{}
+	if err := s.store.WriteState(next); err != nil {
+		return false, state.RunnerState{}, fmt.Errorf("write mismatched workflow job requeue: %w", err)
+	}
+	s.store.AppendLog(st.ID, "control.log", []byte(fmt.Sprintf("runner completed different workflow job %d; original workflow job %d is queued, requeued request\n", observed.ID, st.WorkflowJobID)))
+	s.signalQueue()
+	return true, next, nil
+}
+
+func (s *Server) originalWorkflowJobQueued(ctx context.Context, st state.RunnerState) (bool, error) {
+	if st.WorkflowJobID == 0 || strings.TrimSpace(st.RepositoryFullName) == "" {
+		return false, nil
+	}
+	job, err := s.gh.GetWorkflowJob(ctx, st.RepositoryFullName, st.WorkflowJobID)
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(job.Status), "queued"), nil
 }
 
 func (s *Server) handleAdminRedirect(w http.ResponseWriter, r *http.Request) {
@@ -1667,11 +1755,17 @@ func (s *Server) markWorkflowJobInProgress(id string, job github.WorkflowJob) (s
 		return st, false, nil
 	}
 	if shouldRecordAssignedJob(st, job) {
+		mismatched := workflowJobMismatch(st, job)
 		recordMetric := st.AssignedJobID == 0 && st.AssignedJobName != job.Name
 		st.AssignedJobID = job.ID
 		st.AssignedJobName = job.Name
 		if err := s.store.WriteState(st); err != nil {
 			return state.RunnerState{}, false, err
+		}
+		if mismatched {
+			s.logger.Warn("runner picked up different workflow job", "id", id, "workflow_job_id", st.WorkflowJobID, "assigned_job_id", job.ID, "assigned_job_name", job.Name)
+			s.store.AppendLog(id, "control.log", []byte(fmt.Sprintf("runner picked up different workflow job %d (%s); original workflow job is %d\n", job.ID, job.Name, st.WorkflowJobID)))
+			return st, false, nil
 		}
 		return st, recordMetric, nil
 	}
@@ -1990,6 +2084,34 @@ func (s *Server) stopRunner(ctx context.Context, id string, job github.WorkflowJ
 		s.refreshMetrics()
 		return st, false, cleanupErr
 	}
+	if workflowJobMismatch(st, job) {
+		requeued, next, err := s.requeueMismatchedWorkflowJob(ctx, st, job)
+		if err != nil {
+			return state.RunnerState{}, false, err
+		}
+		if requeued {
+			s.logger.Warn("requeued original workflow job after runner picked up different job", "id", id, "workflow_job_id", st.WorkflowJobID, "assigned_job_id", job.ID, "repository", st.RepositoryFullName)
+			s.refreshMetrics()
+			return next, false, nil
+		}
+		st = next
+		st.Status = state.StatusCompleted
+		st.CompletedAt = time.Now().UTC()
+		st.NextRetryAt = time.Time{}
+		st.LastErrorCode = ""
+		st.LastErrorMessage = ""
+		st.LastErrorRetryable = false
+		st.FailureStage = ""
+		st.FailureReason = ""
+		st.Error = ""
+		if err := s.store.WriteState(st); err != nil {
+			return state.RunnerState{}, false, err
+		}
+		s.logger.Info("mismatched workflow job not requeued because original job is no longer queued", "id", id, "workflow_job_id", st.WorkflowJobID, "assigned_job_id", job.ID)
+		metrics.RecordStop(st.ProfileName, time.Since(stopStartedAt), "success")
+		s.refreshMetrics()
+		return st, false, nil
+	}
 	if st.FailureStage != "" && st.FailureStage != "cleanup" {
 		st.Status = state.StatusFailed
 		st.FailedAt = time.Now().UTC()
@@ -2217,6 +2339,10 @@ func shouldRecordAssignedJob(st state.RunnerState, job github.WorkflowJob) bool 
 		return false
 	}
 	return st.AssignedJobID != job.ID || st.AssignedJobName != job.Name
+}
+
+func workflowJobMismatch(st state.RunnerState, job github.WorkflowJob) bool {
+	return st.WorkflowJobID != 0 && job.ID != 0 && st.WorkflowJobID != job.ID
 }
 
 func (s *Server) signalQueue() {

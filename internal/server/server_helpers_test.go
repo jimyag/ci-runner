@@ -1097,6 +1097,48 @@ func TestReconcileOnceSignalsQueueForQueuedRunner(t *testing.T) {
 	// (It either directly signals or processQueuedRequests ran — we just verify no panic)
 }
 
+func TestReconcileMismatchedCompletedJobsRequeuesOriginalJob(t *testing.T) {
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	srv := newTestServer(t, store, ghServer.URL, &fakeSandbox{})
+	srv.Close()
+
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "1001",
+		Source:             "test",
+		JobID:              1001,
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-1001",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusCompleted
+	st.AssignedJobID = 2002
+	st.AssignedJobName = "prepare"
+	st.CompletedAt = time.Now().UTC()
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.reconcileMismatchedCompletedJobs(t.Context())
+
+	got, err := store.ReadState("1001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != state.StatusQueued {
+		t.Fatalf("expected mismatched completed request to be requeued, got %s", got.Status)
+	}
+	if got.AssignedJobID != 0 || got.AssignedJobName != "" {
+		t.Fatalf("expected assigned job to be cleared, got id=%d name=%q", got.AssignedJobID, got.AssignedJobName)
+	}
+}
+
 // ---------- failStart ----------
 
 func TestFailStartTransitionsRunnerToFailed(t *testing.T) {

@@ -566,7 +566,7 @@ func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
 	}
 	waitForState(t, store, "1001", state.StatusRunning)
 
-	completed := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_job":{"id":2002,"name":"staticcheck","runner_name":"e2b-1001","labels":["self-hosted","e2b"]}}`)
+	completed := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"name":"staticcheck","runner_name":"e2b-1001","labels":["self-hosted","e2b"]}}`)
 	req = httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(completed))
 	req.Header.Set("X-GitHub-Event", "workflow_job")
 	req.Header.Set("X-Hub-Signature-256", sign("secret", completed))
@@ -583,11 +583,58 @@ func TestWebhookCompletedStopsActualRunnerAndRecordsJob(t *testing.T) {
 	if st.Status != state.StatusCompleted {
 		t.Fatalf("expected completed state, got %s", st.Status)
 	}
-	if st.AssignedJobID != 2002 || st.AssignedJobName != "staticcheck" {
+	if st.AssignedJobID != 1001 || st.AssignedJobName != "staticcheck" {
 		t.Fatalf("expected assigned job to be recorded, got id=%d name=%q", st.AssignedJobID, st.AssignedJobName)
 	}
 	if fake.stoppedCount() != 1 {
 		t.Fatalf("expected one sandbox stop, got %d", fake.stoppedCount())
+	}
+}
+
+func TestWorkflowJobMismatchRequeuesOriginalJob(t *testing.T) {
+	ghServer := httptest.NewServer(githubRunnerAPI(t))
+	defer ghServer.Close()
+
+	store := state.New(t.TempDir())
+	fake := &fakeSandbox{}
+	srv := newTestServer(t, store, ghServer.URL, fake)
+	srv.Close()
+
+	_, st, err := store.CreateRequest(state.RunnerRequest{
+		ID:                 "1001",
+		Source:             "test",
+		JobID:              1001,
+		RepositoryFullName: "o/r",
+		Labels:             []string{"self-hosted", "e2b"},
+		ProfileName:        "default",
+		RunnerName:         "e2b-1001",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = state.StatusRunning
+	st.SandboxID = "sb-1001"
+	st.ProcessPID = 42
+	st.RunningAt = time.Now().UTC()
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	got, recorded, err := srv.stopRunner(t.Context(), "1001", github.WorkflowJob{ID: 2002, Name: "prepare", Status: "completed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recorded {
+		t.Fatal("expected mismatched job to suppress workflow completion metrics")
+	}
+	if got.Status != state.StatusQueued {
+		t.Fatalf("expected original job to be requeued, got %s", got.Status)
+	}
+	if got.AssignedJobID != 0 || got.AssignedJobName != "" {
+		t.Fatalf("expected assigned job to be cleared, got id=%d name=%q", got.AssignedJobID, got.AssignedJobName)
+	}
+	if fake.stoppedCount() != 1 {
+		t.Fatalf("expected stolen runner sandbox to be stopped, got %d", fake.stoppedCount())
 	}
 }
 
@@ -652,7 +699,7 @@ func TestWebhookCompletedIsIdempotent(t *testing.T) {
 	}
 	waitForState(t, store, "1001", state.StatusRunning)
 
-	completed := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_job":{"id":2002,"name":"staticcheck","runner_name":"e2b-1001","labels":["self-hosted","e2b"]}}`)
+	completed := []byte(`{"action":"completed","repository":{"full_name":"o/r"},"workflow_job":{"id":1001,"name":"staticcheck","runner_name":"e2b-1001","labels":["self-hosted","e2b"]}}`)
 	for i := 0; i < 2; i++ {
 		req = httptest.NewRequest(http.MethodPost, "/webhooks/github", bytes.NewReader(completed))
 		req.Header.Set("X-GitHub-Event", "workflow_job")
@@ -671,7 +718,7 @@ func TestWebhookCompletedIsIdempotent(t *testing.T) {
 	if st.Status != state.StatusCompleted {
 		t.Fatalf("expected completed state, got %s", st.Status)
 	}
-	if st.AssignedJobID != 2002 || st.AssignedJobName != "staticcheck" {
+	if st.AssignedJobID != 1001 || st.AssignedJobName != "staticcheck" {
 		t.Fatalf("expected assigned job to be recorded, got id=%d name=%q", st.AssignedJobID, st.AssignedJobName)
 	}
 	if fake.stoppedCount() != 1 {

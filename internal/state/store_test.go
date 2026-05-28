@@ -68,6 +68,49 @@ func TestCreateRequestIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestListMismatchedCompletedStates(t *testing.T) {
+	store := New(t.TempDir())
+	_, st, err := store.CreateRequest(RunnerRequest{
+		ID:         "mismatch",
+		Source:     "test",
+		JobID:      1001,
+		Labels:     []string{"self-hosted"},
+		RunnerName: "e2b-mismatch",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Status = StatusCompleted
+	st.AssignedJobID = 2002
+	st.AssignedJobName = "other"
+	if err := store.WriteState(st); err != nil {
+		t.Fatal(err)
+	}
+	_, matched, err := store.CreateRequest(RunnerRequest{
+		ID:         "matched",
+		Source:     "test",
+		JobID:      3003,
+		Labels:     []string{"self-hosted"},
+		RunnerName: "e2b-matched",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matched.Status = StatusCompleted
+	matched.AssignedJobID = 3003
+	if err := store.WriteState(matched); err != nil {
+		t.Fatal(err)
+	}
+
+	states, err := store.ListMismatchedCompletedStates(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 || states[0].ID != "mismatch" {
+		t.Fatalf("expected only mismatched completed state, got %#v", states)
+	}
+}
+
 func TestWriteStateUsesVersionCAS(t *testing.T) {
 	store := New(t.TempDir())
 	_, st, err := store.CreateRequest(RunnerRequest{
