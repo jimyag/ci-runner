@@ -1,5 +1,6 @@
 ARG BASE_PLATFORM=linux/amd64
-FROM --platform=$BASE_PLATFORM jimyag/qbox-kodo-ubuntu-16.04-base:runner-docker
+ARG BASE_IMAGE=jimyag/qbox-kodo-ubuntu-16.04-base:runner-docker
+FROM --platform=$BASE_PLATFORM $BASE_IMAGE
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG RUNNER_VERSION=2.334.0

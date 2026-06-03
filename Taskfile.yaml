@@ -5,6 +5,8 @@ vars:
   IMAGE: ghcr.io/jimyag/e2b-github-runner
   LDFLAGS: "-s -w"
   TEMPLATE_DIR: templates/github-runner-ubuntu-24.04
+  QBOX_KODO_TEMPLATE_DIR: templates/qbox-kodo-ubuntu-16.04
+  QBOX_KODO_BASE_IMAGE: jimyag/qbox-kodo-ubuntu-16.04-base:runner-docker
   GO_PACKAGES: "./cmd/... ./internal/..."
 
 tasks:
@@ -114,6 +116,8 @@ tasks:
     cmds:
       - docker build --check -f Dockerfile .
       - docker build --check --platform=linux/amd64 -f {{.TEMPLATE_DIR}}/e2b.Dockerfile {{.TEMPLATE_DIR}}
+      - docker build --check --platform=linux/amd64 -f {{.QBOX_KODO_TEMPLATE_DIR}}/base.Dockerfile {{.QBOX_KODO_TEMPLATE_DIR}}
+      - docker build --check --platform=linux/amd64 -f {{.QBOX_KODO_TEMPLATE_DIR}}/e2b.Dockerfile {{.QBOX_KODO_TEMPLATE_DIR}}
 
   template-deps:
     desc: Install E2B template dependencies
@@ -130,6 +134,30 @@ tasks:
   template-build-prod:
     desc: Build the production E2B sandbox template
     dir: "{{.TEMPLATE_DIR}}"
+    cmds:
+      - npm run build:prod
+
+  qbox-kodo-base-build:
+    desc: Build the qbox kodo Ubuntu 16.04 base Docker image locally
+    cmds:
+      - docker build --platform=linux/amd64 -f {{.QBOX_KODO_TEMPLATE_DIR}}/base.Dockerfile -t {{.QBOX_KODO_BASE_IMAGE}} {{.QBOX_KODO_TEMPLATE_DIR}}
+
+  qbox-kodo-base-push:
+    desc: Push the qbox kodo Ubuntu 16.04 base Docker image
+    deps:
+      - qbox-kodo-base-build
+    cmds:
+      - docker push {{.QBOX_KODO_BASE_IMAGE}}
+
+  qbox-kodo-template-deps:
+    desc: Install qbox kodo E2B template dependencies
+    dir: "{{.QBOX_KODO_TEMPLATE_DIR}}"
+    cmds:
+      - npm install
+
+  qbox-kodo-template-build-prod:
+    desc: Build the qbox kodo production E2B sandbox template
+    dir: "{{.QBOX_KODO_TEMPLATE_DIR}}"
     cmds:
       - npm run build:prod
 
