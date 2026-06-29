@@ -22,6 +22,7 @@ tasks:
       - go install honnef.co/go/tools/cmd/staticcheck@latest
       - go install mvdan.cc/gofumpt@latest
       - go install golang.org/x/tools/cmd/goimports@latest
+      - go install github.com/cespare/reflex@latest
       - go install github.com/go-task/task/v3/cmd/task@latest
       - go install github.com/goreleaser/goreleaser/v2@latest
 
@@ -32,20 +33,20 @@ tasks:
       - goimports -w cmd internal
 
   ui-deps:
-    desc: Install admin UI dependencies
+    desc: Install UI dependencies
     dir: ui
     cmds:
       - bun install --frozen-lockfile
 
   ui-build:
-    desc: Build the embedded admin UI
+    desc: Build the embedded UI
     dir: ui
     cmds:
       - bun install --frozen-lockfile
       - bun run build
 
   ui-lint:
-    desc: Lint and type-check the admin UI
+    desc: Lint and type-check the UI
     dir: ui
     cmds:
       - bun install --frozen-lockfile
@@ -103,6 +104,78 @@ tasks:
       - ui-build
     cmds:
       - go run ./cmd/{{.BINARY}} {{.CLI_ARGS}}
+
+  dev:
+    desc: Start the UI Vite dev server, smee webhook forwarder, and runnerd with hot reload
+    cmds:
+      - |
+        command -v reflex >/dev/null 2>&1 || {
+          echo "reflex is required for task dev. Run: task deps" >&2
+          exit 1
+        }
+        test -x ui/node_modules/.bin/vite || {
+          echo "UI dependencies are missing. Run: task ui-deps" >&2
+          exit 1
+        }
+
+        export RUNNERD_CONFIG="${RUNNERD_CONFIG:-runnerd.local.yaml}"
+        test -f "${RUNNERD_CONFIG}" || {
+          echo "runnerd config not found: ${RUNNERD_CONFIG}" >&2
+          echo "Create one from runnerd.yaml.example, then update local secrets and OAuth settings." >&2
+          exit 1
+        }
+        export RUNNERD_VITE_PORT="${RUNNERD_VITE_PORT:-5173}"
+        export RUNNERD_VITE_DEV_SERVER_URL="${RUNNERD_VITE_DEV_SERVER_URL:-http://127.0.0.1:${RUNNERD_VITE_PORT}}"
+
+        command -v curl >/dev/null 2>&1 || {
+          echo "curl is required for task dev startup checks." >&2
+          exit 1
+        }
+        if curl -fsS "${RUNNERD_VITE_DEV_SERVER_URL}" >/dev/null 2>&1; then
+          echo "UI dev server address is already in use: ${RUNNERD_VITE_DEV_SERVER_URL}" >&2
+          exit 1
+        fi
+
+        echo "Starting UI on ${RUNNERD_VITE_DEV_SERVER_URL}"
+        echo "Starting runnerd with ${RUNNERD_CONFIG}"
+
+        ./scripts/smee.sh --check
+        (
+          cd ui
+          exec bun run dev --host 127.0.0.1 --port "${RUNNERD_VITE_PORT}" --strictPort
+        ) &
+        UI_PID="$!"
+        ./scripts/smee.sh &
+        SMEE_PID="$!"
+        trap 'kill "$UI_PID" "$SMEE_PID" 2>/dev/null || true' EXIT
+        UI_READY=0
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          if curl -fsS "${RUNNERD_VITE_DEV_SERVER_URL}" >/dev/null 2>&1; then
+            UI_READY=1
+            break
+          fi
+          sleep 0.5
+        done
+        if [ "$UI_READY" != "1" ]; then
+          echo "UI dev server failed to start on ${RUNNERD_VITE_DEV_SERVER_URL}" >&2
+          exit 1
+        fi
+        reflex \
+          -d none -s \
+          -r '\.go$' \
+          -R '\.git/' \
+          -R 'bin/' \
+          -R 'dist/' \
+          -R 'docs/' \
+          -R 'templates/' \
+          -R 'ui/' \
+          -R 'var/' \
+          -- go run -trimpath -tags development ./cmd/{{.BINARY}} --config "${RUNNERD_CONFIG}" {{.CLI_ARGS}}
+
+  smee:
+    desc: Start the smee.io webhook forwarder standalone (reads .smee-url)
+    cmds:
+      - ./scripts/smee.sh
 
   docker-build:
     desc: Build the local Docker image

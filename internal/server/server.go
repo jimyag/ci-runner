@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
-	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -15,7 +14,6 @@ import (
 	"hash/fnv"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -100,9 +98,6 @@ type adminSession struct {
 	ExpiresAt int64  `json:"expires_at"`
 }
 
-//go:embed admin/*
-var adminAssets embed.FS
-
 const runnerJobStartedMarker = "__runner_job_started__"
 
 const (
@@ -171,6 +166,10 @@ func (w *loggingResponseWriter) Write(data []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(data)
 	w.bytes += n
 	return n, err
+}
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func (s *Server) Close() {
@@ -559,24 +558,9 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	data, err := adminAssets.ReadFile("admin" + name)
-	if err != nil {
-		if path.Ext(name) != "" {
-			http.NotFound(w, r)
-			return
-		}
-		data, err = adminAssets.ReadFile("admin/index.html")
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		name = "/index.html"
+	if !s.serveUIAsset(w, r, name) {
+		http.NotFound(w, r)
 	}
-	if contentType := mime.TypeByExtension(path.Ext(name)); contentType != "" {
-		w.Header().Set("Content-Type", contentType)
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(data)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

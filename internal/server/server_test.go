@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/hmac"
@@ -10,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -541,6 +543,10 @@ func TestListRunnerRequestsIsPaginated(t *testing.T) {
 }
 
 func TestAdminUIIsServedWithoutAPIAccess(t *testing.T) {
+	if uiAssetsDevelopment {
+		t.Skip("embedded UI is served only in production asset mode")
+	}
+
 	store := state.New(t.TempDir())
 	srv := newTestServer(t, store, "http://example.test", &fakeSandbox{})
 
@@ -562,6 +568,34 @@ func TestAdminUIIsServedWithoutAPIAccess(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `<div id="root">`) {
 		t.Fatalf("admin route fallback did not serve vite shell")
+	}
+}
+
+func TestLoggingResponseWriterSupportsResponseControllerHijack(t *testing.T) {
+	base := newHijackableResponseWriter()
+	t.Cleanup(base.close)
+	wrapped := &loggingResponseWriter{ResponseWriter: base, status: http.StatusOK}
+
+	conn, _, err := http.NewResponseController(wrapped).Hijack()
+	if err != nil {
+		t.Fatalf("expected logging response writer to delegate hijack: %v", err)
+	}
+	_ = conn.Close()
+	if !base.hijacked {
+		t.Fatal("expected underlying response writer to be hijacked")
+	}
+}
+
+func TestLoggingResponseWriterSupportsResponseControllerFlush(t *testing.T) {
+	base := newHijackableResponseWriter()
+	t.Cleanup(base.close)
+	wrapped := &loggingResponseWriter{ResponseWriter: base, status: http.StatusOK}
+
+	if err := http.NewResponseController(wrapped).Flush(); err != nil {
+		t.Fatalf("expected logging response writer to delegate flush: %v", err)
+	}
+	if !base.flushed {
+		t.Fatal("expected underlying response writer to be flushed")
 	}
 }
 
@@ -1994,6 +2028,48 @@ func waitForStops(t *testing.T, fake *fakeSandbox, want int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("sandbox stops did not reach %d, got %d", want, fake.stoppedCount())
+}
+
+type hijackableResponseWriter struct {
+	header   http.Header
+	client   net.Conn
+	server   net.Conn
+	flushed  bool
+	hijacked bool
+}
+
+func newHijackableResponseWriter() *hijackableResponseWriter {
+	client, server := net.Pipe()
+	return &hijackableResponseWriter{
+		header: http.Header{},
+		client: client,
+		server: server,
+	}
+}
+
+func (w *hijackableResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *hijackableResponseWriter) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (w *hijackableResponseWriter) WriteHeader(statusCode int) {}
+
+func (w *hijackableResponseWriter) Flush() {
+	w.flushed = true
+}
+
+func (w *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	w.hijacked = true
+	rw := bufio.NewReadWriter(bufio.NewReader(w.server), bufio.NewWriter(w.server))
+	return w.server, rw, nil
+}
+
+func (w *hijackableResponseWriter) close() {
+	_ = w.client.Close()
+	_ = w.server.Close()
 }
 
 func sign(secret string, body []byte) string {

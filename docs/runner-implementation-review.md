@@ -1,307 +1,69 @@
 # Runnerd Implementation Review
 
-Date: 2026-05-19
+Date: 2026-06-28
 
 Scope:
 
-- Recent commits reviewed: `19663e8`, `1881790`, `8e7f48e`, `eee1752`.
-- Local references compared:
-  - `bin/actions-runner-controller`
-  - `bin/fireactions`
-- Main target architecture referenced: database-backed runner state, file-free config, GitHub App auth, profile/policy management, retryable E2B operations, restart recovery, public deployment safety, and admin operations.
+- Current branch: `refactor/dev`
+- Review target: implementation status after file-based config, DB-backed runner state, retry/lease/audit handling, admin console, embedded UI assets, and local development workflow updates.
+- Local references still useful for future comparison: actions-runner-controller style reconciliation and fireactions style pool/config modeling.
 
 ## Executive Summary
 
-The recent commits move the project in the right direction: runner state is now DB-backed, profile and repository policy concepts exist, the admin UI can manage basic profile/policy data, GitHub App auth was added, status now uses `queued -> creating -> running -> stopping -> completed/failed`, and `github.com/jimmicro/pprof` is wired in.
+Runnerd has moved past the original 2026-05-19 gap list. Runtime configuration is now file-first, runner state is DB-backed, retry/lease/audit fields exist, GitHub App auth can resolve installations dynamically, the admin console covers the core management workflow, diagnostics expose pprof/expvar state, and the documented local workflow includes `task dev`.
 
-However, the implementation is not yet aligned with the current architecture. The largest gaps are:
+The remaining work is no longer a basic architecture catch-up. The next decisions are product and operations hardening: whether to keep token/basic auth as local compatibility modes, how to introduce non-admin UI surfaces under the shared `ui/` tree, how much config management belongs in the admin console, and what deployment smoke tests are required before treating the service as production-ready.
 
-- Configuration is still environment-variable driven, while the design now says all configuration should come from config files.
-- PAT/token mode still exists, while the design decision was GitHub App only.
-- E2B API failures are not retried; requests fail immediately.
-- The DB state model has no retry, lease, or audit fields, so it is not ready for reliable multi-instance or public deployment.
-- The worker loop is still in-memory driven and scans all states, instead of claiming work through the database.
-- Repository policy checks can be bypassed by manually selecting a profile.
-- Admin management is incomplete: no retry action, audit events, config reload, or full diagnostics workflow.
-- `task lint` currently fails.
+## Current Baseline
 
-## Findings
+- Configuration is loaded from `runnerd.yaml` by default, or from `--config`. Relative sqlite database paths and GitHub App private-key paths resolve from the config file directory.
+- The config schema covers server, database, OAuth session auth, E2B, GitHub webhook/auth/OAuth, allowed repositories, and worker retry/lease/concurrency behavior.
+- Exactly one GitHub API auth mode is allowed: GitHub App, token, or basic auth. GitHub App mode supports optional static `installation_id`; when omitted, runnerd resolves installation access per job repository and caches transports.
+- Runner requests, events, specs, groups, policies, retry metadata, leases, and audit events are stored in the configured database backend.
+- Worker processing uses DB claim/lease semantics and retry scheduling instead of only in-memory queue ownership.
+- Transient E2B, GitHub, rate-limit, timeout, and temporary network failures are classified for retry or queue deferral. Deterministic auth/config/template failures fail immediately.
+- Admin routes expose runner request management, retry/stop/log access, runner specs, runner groups, repository policies, match tests, audit events, and diagnostics.
+- The React UI in `ui/` is embedded for production from `internal/server/ui/*`; development builds proxy UI assets to Vite through `internal/server/ui_assets_development.go`.
+- `task dev` starts Vite and the Go service together in development mode. `task build` builds the UI first, then compiles `bin/runnerd` with embedded production assets.
+- Diagnostics are available through the admin UI and `/diagnostics/pprof` / `/diagnostics/vars`, backed by `github.com/jimmicro/pprof` and expvar.
 
-### P0: Config Is Still Env-Based, Not File-Based
+## Remaining Decisions
 
-The architecture says all settings should be configurable and environment variables should no longer be supported as the primary configuration surface. Current code still loads nearly all runtime configuration from environment variables:
+### 1. Auth Policy
 
-- `internal/config/config.go:62-91` reads `HTTP_ADDR`, `STATE_DIR`, `ADMIN_TOKEN`, `E2B_API_KEY`, `E2B_API_URL`, `E2B_DOMAIN`, GitHub auth, sandbox timeouts, runner labels, and concurrency from env.
-- `internal/config/config.go:96-140` validates missing values as `missing required env`.
-- `internal/config/config.go:168-180` only uses `RUNNERD_CONFIG_FILE` for seed profiles and repository policies, not for the full service config.
+Token and basic auth are still supported alongside GitHub App auth. That is useful for local verification or legacy credentials, but it means the product is not GitHub-App-only. Decide whether these modes are intentional compatibility paths or should be removed before production hardening.
 
-Impact:
+### 2. UI Product Boundary
 
-- Public deployment remains hard to reason about because secrets, auth, DB backend, timeouts, and routing are split across env and DB.
-- The admin UI cannot represent the effective config accurately.
-- It diverges from `fireactions`, which loads a YAML config file with validation in `bin/fireactions/server/config.go:78-112`.
+The asset package has been generalized from admin-only assets to `ui/*`, which leaves room for future ordinary-user screens. The current routed product is still admin-focused under `/admin/*`. Before adding non-admin UI, define route ownership, role-aware navigation, and API permissions so the shared UI tree does not become an accidental admin surface.
 
-Recommendation:
+### 3. Config Management
 
-- Introduce a single `runnerd.yaml` schema for server, auth, database, E2B, GitHub App, profiles, policies, worker, retry, and diagnostics.
-- Keep env support only for explicit secret-file indirection if needed, not as the primary config model.
-- Change validation errors from env names to config paths.
+Runtime config is file-first, but the admin console does not yet provide an effective-config view, config validation preview, reload workflow, or import/export flow. Keep the current file-only operations model unless live config operations become a clear requirement.
 
-### P0: GitHub PAT/Token Mode Still Exists
+### 4. Deployment Smoke
 
-The current decision was to not support PAT migration and use GitHub App auth. Current code still supports token mode:
+Local build/lint/test coverage validates the code path, but production readiness still depends on a real GitHub App installation, real E2B templates, webhook delivery, and sandbox runner execution. Keep a deployment smoke checklist that verifies webhook signature handling, installation resolution, runner spec matching, sandbox creation, GitHub job pickup, cleanup, and diagnostics.
 
-- `internal/config/config.go:23` keeps `GitHubToken`.
-- `internal/config/config.go:109-119` accepts either `GITHUB_TOKEN` or GitHub App fields.
-- `internal/config/config.go:151-156` selects `"token"` when `GitHubToken` is present.
-- `cmd/runnerd/main.go:37-49` creates either `NewAppClient` or token `NewClient`.
-- `internal/github/client.go:96-98` always sets an `Authorization` header using `c.token`.
+### 5. Multi-Instance And Operations
 
-Impact:
+The DB lease model is in place, but multi-process behavior should be verified with two runnerd instances against the same database before documenting multi-instance support. Expvar diagnostics cover useful counters and gauges; add histogram/export adapters only if deployment observability needs them.
 
-- The implementation no longer matches the chosen security model.
-- The GitHub client still mixes token and App transport behavior. `ghinstallation` likely overwrites the auth header, but the code path is confusing and under-tested.
-- It misses the cleaner fireactions model: app transport plus cached installation clients and retryable HTTP in `bin/fireactions/helper/github/client.go:14-77`.
+## Suggested Next Order
 
-Recommendation:
+1. Keep `task dev`, `task build`, `task lint`, and `task test` green on every branch that touches backend/UI boundaries.
+2. Add or update a deployment smoke checklist using a real GitHub App, one repository, and one E2B template.
+3. Decide whether token/basic auth remain supported modes.
+4. Define the non-admin UI route and permission model before adding ordinary-user screens.
+5. Add an effective-config diagnostics view only after the desired config operations model is clear.
+6. Stress DB lease behavior with concurrent runnerd processes before advertising multi-instance support.
 
-- Remove PAT mode entirely from config, validation, client construction, tests, docs, and UI.
-- Make `GitHubApp` the only auth config.
-- Add tests that prove registration token calls work through the app transport without a PAT.
+## Verification Notes
 
-### P0: E2B API Retry Is Not Implemented
-
-The architecture calls for retrying E2B API failures with retry state. Current worker fails immediately:
-
-- `internal/server/server.go:858-865` marks failed immediately when GitHub registration token creation fails.
-- `internal/server/server.go:873-893` marks failed immediately when sandbox start fails.
-- `internal/server/server.go:1089-1103` marks failed immediately on non-404 sandbox stop errors.
-- `internal/server/server.go:206-218` converts creating timeout directly to failed.
-
-The DB schema has no retry fields:
-
-- `internal/state/store.go:135-160` has no `retry_count`, `next_retry_at`, retryable error fields, or lease fields.
-- `internal/state/store.go:880-940` and `internal/state/store.go:942-1002` migrations have no retry indexes.
-
-Impact:
-
-- Transient placement errors like `Failed to place sandbox`, E2B 429/5xx, network timeouts, and temporary stop failures become terminal failures.
-- Admin cannot retry failed requests because there is no retry state or endpoint.
-- Restart recovery cannot distinguish retryable from terminal failures.
-
-Recommendation:
-
-- Add retry fields to `runner_requests`: `retry_count`, `next_retry_at`, `last_error_code`, `last_error_message`, `last_error_retryable`, `last_attempt_at`.
-- Add manual indexes for `(status, next_retry_at, queued_at)` and `(status, updated_at)`.
-- Classify retryable errors: E2B 408/409/425/429/5xx, timeout, temporary network failures; GitHub 5xx/secondary rate limit; non-retryable auth/config errors.
-- Add `POST /runner_requests/{id}/retry` and UI action.
-
-### P1: Worker Claiming Is In-Memory, Not DB-Leased
-
-The worker still scans all states and uses in-process memory to prevent duplicates:
-
-- `internal/server/server.go:144-176` starts three unbounded background loops without a stop context.
-- `internal/server/server.go:178-191` lists all states and starts a goroutine for every queued state.
-- The `Store` interface in `internal/state/store.go:102-120` has no claim/lease method.
-- The request record in `internal/state/store.go:135-160` has no `lease_owner` or `lease_expires_at`.
-
-Impact:
-
-- A Postgres deployment with two runnerd instances can start the same queued request twice.
-- If the process dies after claiming in memory but before starting a sandbox, the DB does not know who owns the request or when it can be retried.
-- Tests can leak background goroutines because server loops have no lifecycle control.
-
-Comparison:
-
-- ARC uses controller-runtime reconciliation and leader/concurrency controls (`bin/actions-runner-controller/main.go:133-155`).
-- fireactions has explicit pool lifecycle state, stop channels, done channels, pending create/delete counters, and cleanup wait groups (`bin/fireactions/server/pool.go:35-57`, `129-180`, `182-220`).
-
-Recommendation:
-
-- Add DB-backed claim APIs:
-  - `ClaimNextQueued(workerID, now, leaseTTL)`.
-  - `ExtendLease(requestID, workerID)`.
-  - `ReleaseLease(requestID, workerID)`.
-- Drive workers from `next_retry_at <= now` and `lease_expires_at < now`.
-- Add a server context and graceful shutdown for loops.
-
-### P1: Repository Policy Can Be Bypassed By Manual Profile Selection
-
-Webhook admission uses profile matching, but manual runner creation can directly request a profile:
-
-- The admin policy endpoints exist in `internal/server/server.go:574-675`.
-- Matching is exposed at `internal/server/server.go:678-692`.
-- Manual creation with explicit `runner_spec_name` loads that profile directly later at `internal/server/server.go:868-872`; it does not enforce that the requested repository is allowed to use that profile.
-
-Impact:
-
-- The policy model cannot be treated as an authorization boundary.
-- A caller with admin API access can create a runner for a repo/profile combination that repository policies would reject.
-
-Recommendation:
-
-- Run repository policy validation for all requests, including manual API calls.
-- If `runner_spec_name` is supplied, check it is one of the profiles allowed by the repository policy.
-- Store both requested labels and selected profile labels separately so admission decisions are auditable.
-
-### P1: Recovery Marks Interrupted Active Jobs As Completed
-
-Restart recovery stops any active sandbox and then marks the request completed:
-
-- `cmd/runnerd/main.go:55-62` calls recovery before serving.
-- `internal/server/server.go:1016-1049` stops the sandbox and writes `StatusCompleted`.
-
-Impact:
-
-- A request that was `creating`, `running`, or `stopping` before process restart can be marked completed even if the GitHub job did not complete.
-- This hides interrupted jobs and makes admin history misleading.
-
-Recommendation:
-
-- Use `stopping` while cleanup is in progress.
-- Mark `failed` for interrupted `creating/running` states unless GitHub confirms the job completed successfully.
-- Reconcile by sandbox metadata `request_id` and GitHub workflow job state where possible.
-
-### P1: DB Schema Is Missing Audit Events And Operational Fields
-
-The current DB schema captures runner state, events, profiles, and repository policies, but not the full control-plane model:
-
-- `internal/state/store.go:880-940` SQLite migration has no `audit_events`.
-- `internal/state/store.go:942-1002` Postgres migration has no `audit_events`.
-- There are no actor/source fields on profile/policy changes.
-- Admin mutations in `internal/server/server.go:522-675` do not write audit events.
-
-Impact:
-
-- Public admin deployment cannot answer who changed a profile, disabled a policy, retried a request, or stopped a sandbox.
-- It weakens incident/debug trails.
-
-Recommendation:
-
-- Add `audit_events` with `id`, `actor`, `action`, `resource_type`, `resource_id`, `payload_json`, `created_at`.
-- Record profile/policy create/patch/delete, runner retry/stop, config reload, and recovery cleanup.
-- Expose `GET /audit-events` in admin.
-
-### P2: Metrics And Diagnostics Coverage
-
-The project intentionally uses `github.com/jimmicro/pprof` and `expvar`, not Prometheus. That difference is acceptable because it follows the current user requirement. The implementation now covers the main ARC and Fireactions signal families through expvar:
-
-- Profile gauges: current, busy, idle, desired, pending, enabled status.
-- Request gauges: profile/status, repository/status, retry state, worker leases.
-- Runner operation metrics: create/stop duration totals and counts, generic operation totals.
-- GitHub operation metrics: API operation totals and duration totals.
-- Runner lifecycle metrics: registration and cleanup counters.
-- Workflow job metrics: queued/started/completed counters, conclusions, failures, queue duration totals/counts, run duration totals/counts.
-
-Remaining differences:
-
-- expvar exposes cumulative totals and counts, not Prometheus histogram buckets.
-- Workflow names can be `unknown` on paths where GitHub only provides runner state, because workflow name is not persisted in `RunnerState`.
-- Metrics are refreshed only when selected endpoints or state transitions call `refreshMetrics`.
-- `internal/server/server.go:695-710` diagnostics hardcode DB assumptions in the response path and do not fully reflect a configurable DB backend.
-
-Comparison:
-
-- ARC tracks queue duration, run duration, conclusions, started/completed/queued counts, and workflow failures in `bin/actions-runner-controller/pkg/actionsmetrics/metrics.go:76-129`.
-- fireactions tracks current/desired/pending pool state directly inside pool reconciliation (`bin/fireactions/server/pool.go:117-124`, `155-165`).
-
-Recommendation:
-
-- Keep jimmicro/pprof and expvar unless a Prometheus endpoint becomes a deployment requirement.
-- If richer latency analysis is needed, add histogram buckets or export expvar to Prometheus in a separate adapter.
-- Refresh gauges periodically from the reconciler, not only through API reads.
-
-### P2: Admin UI Does Not Cover The Full Control Plane
-
-The admin UI can manage basic profiles/policies and view diagnostics, but important operations are missing:
-
-- No retry failed request action.
-- No audit event viewer.
-- No config preview/reload/import workflow.
-- No DB backend/status view.
-- No worker/retry queue view.
-- No repository policy enforcement test that includes explicit profile selection.
-
-Recommendation:
-
-- Add admin screens/actions after the backend APIs exist:
-  - retry request.
-  - stop request idempotently.
-  - audit timeline.
-  - config effective view.
-  - profile policy test with repository, labels, and requested profile.
-
-### P2: Lint Currently Fails
-
-`task lint` fails:
-
-```text
-internal/state/store.go:527:31: should convert record (type repositoryPolicyRecord) to RepositoryPolicy instead of using struct literal (S1016)
-internal/state/store.go:566:10: should convert saved (type repositoryPolicyRecord) to RepositoryPolicy instead of using struct literal (S1016)
-internal/state/store.go:576:9: should convert saved (type repositoryPolicyRecord) to RepositoryPolicy instead of using struct literal (S1016)
-```
-
-Impact:
-
-- Local checks are not green.
-- This should be fixed before relying on the branch.
-
-## Comparison With fireactions
-
-| Area | fireactions | Current runnerd | Gap |
-| --- | --- | --- | --- |
-| Config | YAML file with validation | Env-first, config file only seeds profiles/policies | Need full config file model |
-| GitHub auth | GitHub App transport | App plus PAT/token fallback | Remove PAT/token |
-| HTTP retries | `hashicorp/go-retryablehttp` | No retryable GitHub/E2B client | Add retry policy |
-| Installation handling | Cached installation clients | Single installation id/client | OK for single install, weak for org/multi-repo |
-| Pool model | Desired/current/pending, active/pause, graceful stop | Queue scan plus global slots | Need DB leases and profile concurrency |
-| Metrics | Prometheus pool metrics | expvar partial metrics | Keep expvar, expand coverage |
-
-## Comparison With actions-runner-controller
-
-| Area | ARC | Current runnerd | Gap |
-| --- | --- | --- | --- |
-| Reconciliation | Controller reconciliation with concurrency controls | Polling loops and in-memory pending map | Need DB claim/lease reconcile |
-| Metrics | Queue/run durations, conclusions, failures | Basic counts and duration totals | Need queue/run/failure metrics |
-| pprof | Configurable address flag | jimmicro pprof auto artifact discovery | Acceptable, but expose in config/admin |
-| Runner groups | Models GitHub runner group visibility | Local `runner_group` string only | Need decide whether to enforce via GitHub API |
-| Multi-instance | Kubernetes leader/concurrency model | Not safe on shared DB | Add lease or single-instance guarantee |
-
-## Missing Design Points
-
-- Full config file schema and validation.
-- DB backend selection from config.
-- Retry state and retry worker.
-- DB-backed worker lease.
-- Audit event table and admin audit viewer.
-- Config reload/preview/apply.
-- Manual request admission through repository policies.
-- Per-profile concurrency enforcement. Current slot limit is global.
-- GitHub App installation discovery or per-repo installation mapping.
-- Runner group visibility validation if org-level runner groups are expected.
-- Idempotent retry/stop semantics across restarts and multiple instances.
-
-## Suggested Fix Order
-
-1. Make local checks green.
-2. Replace env config with `runnerd.yaml` and wire DB backend selection.
-3. Remove PAT/token mode and simplify GitHub client around GitHub App only.
-4. Add retry/lease schema and migration SQL.
-5. Replace in-memory worker claiming with DB claims.
-6. Add E2B/GitHub retry classification and retry worker.
-7. Enforce repository policies for manual and webhook requests.
-8. Add audit events and admin views/actions.
-9. Expand diagnostics and expvar metrics.
-10. Improve restart recovery with sandbox/GitHub reconciliation.
-
-## Verification
-
-Executed locally:
+The stale findings from the 2026-05-19 review have been retired because the referenced implementation has changed materially. Re-run the current verification commands when this document is updated:
 
 ```bash
 task lint
+task test
+task build
 ```
-
-Result: failed with staticcheck `S1016` in `internal/state/store.go`.
-
-The UI build step inside `task lint` completed successfully before staticcheck failed.

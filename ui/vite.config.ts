@@ -24,7 +24,7 @@ export default defineConfig({
   },
   build: {
     target: "esnext",
-    outDir: "../internal/server/admin",
+    outDir: "../internal/server/ui",
     emptyOutDir: true,
     modulePreload: false,
     rollupOptions: {

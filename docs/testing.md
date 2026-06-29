@@ -119,6 +119,29 @@ github:
 
 ## 3. 启动服务
 
+开发 UI 或后端时，优先使用开发模式：
+
+```bash
+task deps
+task ui-deps
+cp runnerd.yaml.example runnerd.local.yaml
+task dev
+```
+
+`task dev` 默认读取 `runnerd.local.yaml`，启动 Vite dev server 到 `127.0.0.1:5173`，并用 `development` build tag 启动 Go 服务。浏览器仍然访问 runnerd 的地址，例如：
+
+```text
+http://127.0.0.1:25500/admin/
+```
+
+如需换配置文件：
+
+```bash
+RUNNERD_CONFIG=./runnerd.yaml task dev
+```
+
+生产模式或验证嵌入式前端资源时，直接启动 Go 服务：
+
 ```bash
 go run ./cmd/runnerd --config ./runnerd.yaml
 ```
@@ -147,7 +170,7 @@ go run ./cmd/runnerd --config ./runnerd.yaml --bootstrap-admin github:<your-gith
 export COOKIE_JAR=./runnerd.cookies
 ```
 
-后台页面源码在 `ui/`，使用和 `kubevirt-console` 相同的 React、Vite、Tailwind CSS、shadcn 风格组件和主题 CSS。`task build` 会先执行 `task ui-build`，把前端产物写入 `internal/server/admin/` 后再编译 `runnerd`。管理面现在包含 runners、runner specs、runner policies、retry、audit、label match test 和 diagnostics 页面。
+后台页面源码在 `ui/`，使用和 `kubevirt-console` 相同的 React、Vite、Tailwind CSS、shadcn 风格组件和主题 CSS。`task build` 会先执行 `task ui-build`，把前端产物写入 `internal/server/ui/` 后再编译 `runnerd`。开发模式下 `internal/server/ui_assets_development.go` 会把 UI 资源代理到 Vite；生产构建下 `internal/server/ui_assets_production.go` 会嵌入 `internal/server/ui/*`。管理面现在包含 runners、runner specs、runner policies、retry、audit、label match test 和 diagnostics 页面。
 
 先创建一个默认 runner spec：
 
@@ -215,11 +238,27 @@ curl -fsS -b "$COOKIE_JAR" http://127.0.0.1:25500/diagnostics/pprof | jq
 
 GitHub webhook 必须能访问到本地服务。任选一种方式：
 
+使用 smee：
+
+```bash
+open https://smee.io/new
+echo 'https://smee.io/<your-channel>' > .smee-url
+task dev
+```
+
+把同一个 smee URL 填到 GitHub webhook 的 Payload URL。`.smee-url` 存在时，`task dev` 会自动启动 smee forwarder。也可以用 `task smee` 单独启动转发。默认转发到 `http://127.0.0.1:25500/webhooks/github`；如果 `runnerd.yaml` 使用了其他监听地址，可以设置 `SMEE_TARGET`：
+
+```bash
+SMEE_TARGET=http://127.0.0.1:25501/webhooks/github task smee
+```
+
+也可以使用 ngrok：
+
 ```bash
 ngrok http 25500
 ```
 
-或：
+或 cloudflared：
 
 ```bash
 cloudflared tunnel create e2b-local-runner
@@ -249,7 +288,7 @@ Settings -> Webhooks -> Add webhook
 
 - Payload URL：`https://<public-host>/webhooks/github`
 - Content type：`application/json`
-- Secret：和 `GITHUB_WEBHOOK_SECRET` 完全一致。
+- Secret：和 `runnerd.yaml` 里的 `github.webhook_secret` 完全一致。
 - Which events：选择 `Workflow jobs`。如果希望开启补偿路径，也可以同时选择 `Workflow runs`。
 - Active：勾选。
 
@@ -309,10 +348,10 @@ curl -fsS -b "$COOKIE_JAR" \
 
 常见问题：
 
-- `invalid signature`：GitHub webhook secret 和 `GITHUB_WEBHOOK_SECRET` 不一致。
+- `invalid signature`：GitHub webhook secret 和 `github.webhook_secret` 不一致。
 - `runner concurrency limit reached`：活跃 request 数量达到 `worker.max_concurrent_runners`。
 - GitHub job 一直 queued：workflow 的 `runs-on` labels 必须包含 `self-hosted` 和 `e2b`。
-- sandbox 创建失败：确认 `E2B_API_KEY`、`E2B_API_URL`、`E2B_DOMAIN` 是否匹配本地环境。
+- sandbox 创建失败：确认 `e2b.api_key`、`e2b.api_url` 和 template 配置是否匹配本地环境。
 - registration token 失败：确认 GitHub App installation 对目标仓库有对应的 administration/self-hosted runner 权限。
 
 ## 9. GitHub Actions 日志怎么看
