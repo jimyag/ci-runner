@@ -764,13 +764,33 @@ func TestDiagnosticsPprofEndpointReturnsJSON(t *testing.T) {
 	}
 }
 
-func TestRedactDatabaseURLRemovesCredentials(t *testing.T) {
-	got := redact.DatabaseURL("postgres://runner:secret@example.test/runnerd?sslmode=disable")
+func TestRedactDatabaseDSNRemovesPostgresURLCredentials(t *testing.T) {
+	got := redact.DatabaseDSN("postgres://runner:secret@example.test/runnerd?sslmode=disable")
 	if strings.Contains(got, "runner:") || strings.Contains(got, "secret") {
-		t.Fatalf("database URL leaked credentials: %s", got)
+		t.Fatalf("database DSN leaked credentials: %s", got)
 	}
 	if !strings.Contains(got, "example.test") || !strings.Contains(got, "runnerd") {
-		t.Fatalf("database URL lost non-secret location fields: %s", got)
+		t.Fatalf("database DSN lost non-secret location fields: %s", got)
+	}
+}
+
+func TestRedactDatabaseDSNRemovesMySQLCredentials(t *testing.T) {
+	got := redact.DatabaseDSN("runner:secret@tcp(mysql.example:3306)/runnerd?parseTime=true")
+	if strings.Contains(got, "runner:") || strings.Contains(got, "secret") {
+		t.Fatalf("database DSN leaked credentials: %s", got)
+	}
+	if !strings.Contains(got, "mysql.example:3306") || !strings.Contains(got, "runnerd") {
+		t.Fatalf("database DSN lost non-secret location fields: %s", got)
+	}
+}
+
+func TestRedactDatabaseDSNRemovesPostgresKeyValuePassword(t *testing.T) {
+	got := redact.DatabaseDSN("host=localhost user=postgres password='secret value' dbname=runnerd")
+	if strings.Contains(got, "secret") {
+		t.Fatalf("database DSN leaked key-value password: %s", got)
+	}
+	if !strings.Contains(got, "host=localhost") || !strings.Contains(got, "dbname=runnerd") {
+		t.Fatalf("database DSN lost non-secret key-value fields: %s", got)
 	}
 }
 

@@ -15,14 +15,14 @@ cp runnerd.yaml.example runnerd.yaml
 The config file covers:
 
 - server listen address and timeouts
-- sqlite or Postgres database backend and DSN/path
+- sqlite, Postgres, or MySQL database backend and DSN/path
 - E2B API settings and template
 - GitHub webhook settings plus GitHub App, PAT, or basic auth
 - GitHub App OAuth login for the admin console
 - worker lease / retry / concurrency settings
 
-Relative sqlite `database.url` and `github.app.private_key_file` paths are resolved from the directory containing `runnerd.yaml`.
-Use sqlite for local and small single-node deployments. Postgres is supported by the state store, but shared-database multi-instance operation should be verified in your deployment before advertising it as supported.
+Relative sqlite `database.dsn` and `github.app.private_key_file` paths are resolved from the directory containing `runnerd.yaml`. Legacy `database.url` is still accepted as a deprecated alias when `database.dsn` is empty.
+Use sqlite for local and small single-node deployments. Postgres and MySQL are supported by the state store, but shared-database multi-instance operation should be verified in your deployment before advertising it as supported.
 GitHub Enterprise Server is not currently supported; configure a GitHub.com App installation.
 Configure exactly one GitHub auth method: `github.app`, `github.token`, or `github.basic_auth`. For GitHub App auth, `github.app.installation_id` is optional. When it is omitted, runnerd resolves the installation from each job repository and caches installation transports, allowing one GitHub App to serve multiple installed accounts.
 `github.allowed_repositories` is an optional allowlist of `owner/repo` or `owner/*` patterns. Empty means all repositories that can deliver valid webhooks and match runner labels/policies are allowed.
@@ -32,6 +32,7 @@ Configure exactly one GitHub auth method: `github.app`, `github.token`, or `gith
 `/webhooks/github` uses GitHub HMAC signature verification. The manual management API under `/runner_requests` requires a valid GitHub OAuth admin session cookie.
 
 Runner state is persisted in a DB-backed store instead of per-request JSON directories. Control/stdout/stderr logs are kept as runner events and remain available from the admin API and UI.
+Schema creation is GORM-model driven on startup. Existing state databases are migrated by `AutoMigrate` plus a narrow compatibility pre-pass for older schema columns, so keep old-schema upgrade tests green when changing state records.
 
 ## Run
 
@@ -55,9 +56,9 @@ cp runnerd.yaml.example runnerd.local.yaml
 task dev
 ```
 
-`task dev` starts the Vite UI dev server on `127.0.0.1:5173` by default, starts the smee webhook forwarder when `.smee-url` exists, and runs `runnerd` with the `development` build tag. The Go server still listens on the address from `runnerd.local.yaml`, commonly `:25500`, and proxies embedded UI assets to Vite. Open `http://127.0.0.1:25500/admin/` while developing.
+`task dev` starts the Vite UI dev server on the first available localhost port at or after `5173`, starts the smee webhook forwarder when `.smee-url` exists, and runs `runnerd` with the `development` build tag. The Go server still listens on the address from `runnerd.local.yaml`, commonly `:25500`, and proxies embedded UI assets to Vite. Open `http://127.0.0.1:25500/admin/` while developing.
 
-Set `RUNNERD_CONFIG` to use another config file, or `RUNNERD_VITE_PORT` when port `5173` is already in use.
+Set `RUNNERD_CONFIG` to use another config file, or `RUNNERD_VITE_PORT` to require a specific Vite port.
 
 For local GitHub webhook forwarding, create a per-developer smee channel file:
 

@@ -3,15 +3,29 @@ package state
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
+
+func closeTestDB(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestSQLiteStoreUsesWALAndBusyTimeout(t *testing.T) {
 	store := NewWithOptions(Options{
 		Backend:        BackendSQLite,
-		DatabaseURL:    t.TempDir() + "/runnerd.db",
+		DatabaseDSN:    t.TempDir() + "/runnerd.db",
 		MigrateOnStart: true,
 	}).(*DBStore)
 	if err := store.Ensure(); err != nil {
@@ -44,6 +58,48 @@ func TestSQLiteStoreUsesWALAndBusyTimeout(t *testing.T) {
 	if busyTimeout != 15000 {
 		t.Fatalf("busy_timeout = %d, want 15000", busyTimeout)
 	}
+
+	var foreignKeys int
+	if err := db.Raw("PRAGMA foreign_keys").Scan(&foreignKeys).Error; err != nil {
+		t.Fatal(err)
+	}
+	if foreignKeys != 1 {
+		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+	}
+}
+
+func TestMySQLStoreBackendIsRecognized(t *testing.T) {
+	store := NewWithOptions(Options{
+		Backend:        "mysql",
+		DatabaseDSN:    "not a valid mysql dsn",
+		MigrateOnStart: false,
+	}).(*DBStore)
+
+	err := store.Ensure()
+	if err == nil {
+		t.Fatal("expected invalid mysql DSN to fail")
+	}
+	if strings.Contains(err.Error(), "unsupported state backend") {
+		t.Fatalf("mysql backend should be recognized, got %v", err)
+	}
+}
+
+func TestMySQLDSNWithParseTime(t *testing.T) {
+	dsn, err := mysqlDSNWithParseTime("runner:secret@tcp(mysql.example:3306)/runnerd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "parseTime=true") {
+		t.Fatalf("expected parseTime=true in DSN, got %q", dsn)
+	}
+
+	dsn, err = mysqlDSNWithParseTime("runner:secret@tcp(mysql.example:3306)/runnerd?parseTime=false&charset=utf8mb4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "parseTime=true") || !strings.Contains(dsn, "charset=utf8mb4") {
+		t.Fatalf("expected parseTime=true with existing params preserved, got %q", dsn)
+	}
 }
 
 func TestCreateRequestIsIdempotent(t *testing.T) {
@@ -66,6 +122,37 @@ func TestCreateRequestIsIdempotent(t *testing.T) {
 	}
 	if st.ID != "123" {
 		t.Fatalf("unexpected state id: %q", st.ID)
+	}
+}
+
+func TestCreateRequestConflictingWorkflowJobReturnsExistingState(t *testing.T) {
+	store := New(t.TempDir())
+	_, st, err := store.CreateRequest(RunnerRequest{
+		ID:         "first",
+		Source:     "test",
+		JobID:      12345,
+		Labels:     []string{"self-hosted"},
+		RunnerName: "e2b-first",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	created, conflict, err := store.CreateRequest(RunnerRequest{
+		ID:         "second",
+		Source:     "test",
+		JobID:      12345,
+		Labels:     []string{"self-hosted"},
+		RunnerName: "e2b-second",
+	}, nil)
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+	if created {
+		t.Fatal("expected conflicting workflow job to reuse existing row")
+	}
+	if conflict.ID != st.ID || conflict.WorkflowJobID != 12345 {
+		t.Fatalf("unexpected conflicting state: %#v", conflict)
 	}
 }
 
@@ -270,32 +357,106 @@ func TestLinkOAuthIdentityToAccountRejectsIdentityOnDifferentAccount(t *testing.
 	}
 }
 
-func TestOAuthIdentityRequiresExistingAccount(t *testing.T) {
+func TestMigrateDoesNotCreateOAuthIdentityForeignKey(t *testing.T) {
 	store := New(t.TempDir()).(*DBStore)
 	db, err := store.dbOrEnsure()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	var foreignKeys []struct {
+		ID int `gorm:"column:id"`
+	}
+	if err := db.Raw("PRAGMA foreign_key_list(oauth_identities)").Scan(&foreignKeys).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(foreignKeys) != 0 {
+		t.Fatalf("expected oauth_identities to have no database foreign keys, got %d", len(foreignKeys))
+	}
+}
+
+func TestMigrateDropsLegacyOAuthIdentityForeignKey(t *testing.T) {
+	dir := t.TempDir()
+	databaseURL := dir + "/runnerd.db"
+	store := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: false,
+	}).(*DBStore)
+	db, err := store.open()
+	if err != nil {
+		t.Fatal(err)
+	}
 	now := time.Now().UTC()
-	err = db.Create(&oauthIdentityRecord{
-		AccountID:     999,
+	if err := db.Exec(`CREATE TABLE accounts (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		role TEXT NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL
+	);`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`CREATE TABLE oauth_identities (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		account_id INTEGER NOT NULL,
+		oauth_provider TEXT NOT NULL,
+		oauth_subject TEXT NOT NULL,
+		oauth_login TEXT NOT NULL,
+		created_at TIMESTAMP NOT NULL,
+		updated_at TIMESTAMP NOT NULL,
+		CONSTRAINT fk_oauth_identities_account FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+	);`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`INSERT INTO accounts (id, role, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+		1, "admin", now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`INSERT INTO oauth_identities (id, account_id, oauth_provider, oauth_subject, oauth_login, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		1, 1, "github", "12345", "octocat", now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeTestDB(t, db)
+
+	migrated := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: true,
+	}).(*DBStore)
+	db, err = migrated.dbOrEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var foreignKeys []struct {
+		ID int `gorm:"column:id"`
+	}
+	if err := db.Raw("PRAGMA foreign_key_list(oauth_identities)").Scan(&foreignKeys).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(foreignKeys) != 0 {
+		t.Fatalf("expected legacy oauth_identities foreign keys to be removed, got %d", len(foreignKeys))
+	}
+}
+
+func TestLinkOAuthIdentityToAccountRequiresExistingAccount(t *testing.T) {
+	store := New(t.TempDir())
+	_, _, err := store.LinkOAuthIdentityToAccount(999, OAuthIdentity{
 		OAuthProvider: "github",
 		OAuthSubject:  "12345",
 		OAuthLogin:    "octocat",
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}).Error
-	if err == nil {
-		t.Fatal("expected foreign key error for missing account")
+	})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected missing account to be rejected by store logic, got %v", err)
 	}
 }
 
-func TestMigrateLegacyUsersToAccountsAndOAuthIdentities(t *testing.T) {
+func TestMigrateDoesNotHandleLegacyUsers(t *testing.T) {
 	dir := t.TempDir()
 	databaseURL := dir + "/runnerd.db"
 	store := NewWithOptions(Options{
 		Backend:        BackendSQLite,
-		DatabaseURL:    databaseURL,
+		DatabaseDSN:    databaseURL,
 		MigrateOnStart: false,
 	}).(*DBStore)
 	db, err := store.open()
@@ -305,8 +466,6 @@ func TestMigrateLegacyUsersToAccountsAndOAuthIdentities(t *testing.T) {
 	now := time.Now().UTC()
 	if err := db.Exec(`CREATE TABLE users (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		oauth_provider TEXT NOT NULL,
-		oauth_subject TEXT NOT NULL,
 		oauth_login TEXT NOT NULL,
 		role TEXT NOT NULL,
 		created_at TIMESTAMP NOT NULL,
@@ -314,8 +473,8 @@ func TestMigrateLegacyUsersToAccountsAndOAuthIdentities(t *testing.T) {
 	);`).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Exec(`INSERT INTO users (id, oauth_provider, oauth_subject, oauth_login, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		42, "github", "12345", "octocat", "admin", now, now).Error; err != nil {
+	if err := db.Exec(`INSERT INTO users (id, oauth_login, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+		42, "octocat", "admin", now, now).Error; err != nil {
 		t.Fatal(err)
 	}
 	sqlDB, err := db.DB()
@@ -328,34 +487,31 @@ func TestMigrateLegacyUsersToAccountsAndOAuthIdentities(t *testing.T) {
 
 	migrated := NewWithOptions(Options{
 		Backend:        BackendSQLite,
-		DatabaseURL:    databaseURL,
+		DatabaseDSN:    databaseURL,
 		MigrateOnStart: true,
 	}).(*DBStore)
-	account, identity, err := migrated.GetAccountByOAuthIdentity("github", "12345")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if account.ID != 42 || account.Role != "admin" {
-		t.Fatalf("expected legacy admin account to migrate, got %#v", account)
-	}
-	if identity.AccountID != account.ID || identity.OAuthLogin != "octocat" {
-		t.Fatalf("expected legacy oauth identity to migrate, got account=%#v identity=%#v", account, identity)
-	}
 	db, err = migrated.dbOrEnsure()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Migrator().HasTable("users") {
-		t.Fatal("expected legacy users table to be removed after migration")
+	if !db.Migrator().HasTable("users") {
+		t.Fatal("expected legacy users table to be left untouched")
+	}
+	var count int64
+	if err := db.Table("users").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("expected legacy users row to remain untouched, got %d", count)
 	}
 }
 
-func TestMigrateLegacyUsersIsIdempotentAfterPartialBackfill(t *testing.T) {
+func TestMigrateBackfillsLegacyRunnerProfileDefaultAvailable(t *testing.T) {
 	dir := t.TempDir()
 	databaseURL := dir + "/runnerd.db"
 	store := NewWithOptions(Options{
 		Backend:        BackendSQLite,
-		DatabaseURL:    databaseURL,
+		DatabaseDSN:    databaseURL,
 		MigrateOnStart: false,
 	}).(*DBStore)
 	db, err := store.open()
@@ -363,54 +519,186 @@ func TestMigrateLegacyUsersIsIdempotentAfterPartialBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	if err := db.Exec(`CREATE TABLE users (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		oauth_provider TEXT NOT NULL,
-		oauth_subject TEXT NOT NULL,
-		oauth_login TEXT NOT NULL,
-		role TEXT NOT NULL,
+	if err := db.Exec(`CREATE TABLE runner_profiles (
+		name TEXT PRIMARY KEY,
+		labels_json TEXT NOT NULL,
+		template_id TEXT NOT NULL,
+		runner_group TEXT,
+		max_concurrency INTEGER NOT NULL,
+		min_idle INTEGER NOT NULL DEFAULT 0,
+		priority INTEGER NOT NULL DEFAULT 0,
+		enabled BOOLEAN NOT NULL,
 		created_at TIMESTAMP NOT NULL,
 		updated_at TIMESTAMP NOT NULL
 	);`).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Exec(`INSERT INTO users (id, oauth_provider, oauth_subject, oauth_login, role, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		42, "github", "12345", "octocat", "admin", now, now).Error; err != nil {
+	if err := db.Exec(`INSERT INTO runner_profiles (name, labels_json, template_id, runner_group, max_concurrency, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		"default", `["self-hosted"]`, "base", "default", 1, true, now, now).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&accountRecord{}, &oauthIdentityRecord{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Exec(`INSERT INTO accounts (id, role, created_at, updated_at)
-		SELECT id, role, created_at, updated_at FROM users`).Error; err != nil {
-		t.Fatal(err)
-	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sqlDB.Close(); err != nil {
-		t.Fatal(err)
-	}
+	closeTestDB(t, db)
 
 	migrated := NewWithOptions(Options{
 		Backend:        BackendSQLite,
-		DatabaseURL:    databaseURL,
+		DatabaseDSN:    databaseURL,
 		MigrateOnStart: true,
 	}).(*DBStore)
-	account, identity, err := migrated.GetAccountByOAuthIdentity("github", "12345")
+	profile, err := migrated.GetProfile("default")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if account.ID != 42 || account.Role != "admin" || identity.AccountID != account.ID || identity.OAuthLogin != "octocat" {
-		t.Fatalf("expected partial legacy backfill to complete, got account=%#v identity=%#v", account, identity)
+	if !profile.DefaultAvailable {
+		t.Fatal("expected legacy runner profile to default to globally available")
 	}
-	db, err = migrated.dbOrEnsure()
+}
+
+func TestMigrateBackfillsLegacyRepositoryPolicyRunnerGroupName(t *testing.T) {
+	dir := t.TempDir()
+	databaseURL := dir + "/runnerd.db"
+	store := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: false,
+	}).(*DBStore)
+	db, err := store.open()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.Migrator().HasTable("users") {
-		t.Fatal("expected legacy users table to be removed after idempotent migration")
+	now := time.Now().UTC()
+	if err := db.Exec(`CREATE TABLE repository_policies (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		repository_full_name TEXT NOT NULL,
+		profile_name TEXT NOT NULL,
+		enabled BOOLEAN NOT NULL,
+		created_at TIMESTAMP NOT NULL
+	);`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`INSERT INTO repository_policies (repository_full_name, profile_name, enabled, created_at) VALUES (?, ?, ?, ?)`,
+		"owner/repo", "default", true, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeTestDB(t, db)
+
+	migrated := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: true,
+	}).(*DBStore)
+	policies, err := migrated.ListRepositoryPolicies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(policies) != 1 {
+		t.Fatalf("expected one repository policy, got %d", len(policies))
+	}
+	if policies[0].RunnerGroupName != "" {
+		t.Fatalf("expected legacy repository policy runner group to default empty, got %q", policies[0].RunnerGroupName)
+	}
+}
+
+func TestRepositoryPolicyIndexesArePortable(t *testing.T) {
+	store := New(t.TempDir()).(*DBStore)
+	db, err := store.dbOrEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var indexSQL []string
+	if err := db.Raw(`SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'repository_policies' AND name = 'idx_repository_policies_unique' AND sql IS NOT NULL`).Scan(&indexSQL).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(indexSQL) != 1 {
+		t.Fatalf("expected portable repository policy unique index, got %d", len(indexSQL))
+	}
+	for _, sql := range indexSQL {
+		if strings.Contains(strings.ToUpper(sql), " WHERE ") {
+			t.Fatalf("repository policy index should not use a partial WHERE clause: %s", sql)
+		}
+		if !strings.Contains(strings.ToUpper(sql), "UNIQUE") {
+			t.Fatalf("repository policy index should enforce uniqueness: %s", sql)
+		}
+	}
+
+	duplicate := repositoryPolicyRecord{
+		RepositoryFullName: "owner/repo",
+		ProfileName:        "default",
+		Enabled:            true,
+		CreatedAt:          time.Now().UTC(),
+	}
+	if err := db.Create(&duplicate).Error; err != nil {
+		t.Fatal(err)
+	}
+	duplicate.ID = 0
+	if err := db.Create(&duplicate).Error; err == nil {
+		t.Fatal("expected duplicate repository policy insert to fail")
+	}
+}
+
+func TestUpsertRepositoryPolicyConcurrentCreateIsIdempotent(t *testing.T) {
+	store := New(t.TempDir())
+	const workers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(enabled bool) {
+			defer wg.Done()
+			_, err := store.UpsertRepositoryPolicy(RepositoryPolicy{
+				RepositoryFullName: "owner/repo",
+				ProfileName:        "default",
+				Enabled:            enabled,
+			})
+			errs <- err
+		}(i%2 == 0)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("expected concurrent policy upsert to be idempotent, got %v", err)
+		}
+	}
+
+	policies, err := store.ListRepositoryPolicies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matches int
+	for _, policy := range policies {
+		if policy.RepositoryFullName == "owner/repo" && policy.ProfileName == "default" {
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("expected one repository policy after concurrent upsert, got %d", matches)
+	}
+}
+
+func TestLargePayloadColumnsUseTextType(t *testing.T) {
+	store := New(t.TempDir()).(*DBStore)
+	db, err := store.dbOrEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for table, columns := range map[string][]string{
+		"runner_requests": {"github_payload_json"},
+		"runner_events":   {"message", "payload_json"},
+		"audit_events":    {"payload_json"},
+	} {
+		for _, column := range columns {
+			var info struct {
+				Type string
+			}
+			if err := db.Raw("SELECT type FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&info).Error; err != nil {
+				t.Fatal(err)
+			}
+			if !strings.EqualFold(info.Type, "text") {
+				t.Fatalf("%s.%s type = %q, want text", table, column, info.Type)
+			}
+		}
 	}
 }
 
@@ -475,6 +763,8 @@ func TestIsTransientStoreErrorRecognizesPostgresSQLSTATE(t *testing.T) {
 	for _, message := range []string{
 		"ERROR: transaction failed (SQLSTATE 40001)",
 		"ERROR: transaction failed (SQLSTATE 40P01)",
+		"Error 1213 (40001): Deadlock found when trying to get lock; try restarting transaction",
+		"Error 1205 (HY000): Lock wait timeout exceeded; try restarting transaction",
 	} {
 		t.Run(message, func(t *testing.T) {
 			if !isTransientStoreError(errors.New(message)) {

@@ -11,7 +11,7 @@ cp runnerd.yaml.example runnerd.yaml
 mkdir -p ./secrets
 ```
 
-相对 sqlite `database.url` 和 `github.app.private_key_file` 都相对 `runnerd.yaml` 所在目录解析。当前只支持 GitHub.com，不支持 GitHub Enterprise Server。GitHub 鉴权可以使用 GitHub App、PAT token 或 basic auth，但只能三选一。
+相对 sqlite `database.dsn` 和 `github.app.private_key_file` 都相对 `runnerd.yaml` 所在目录解析。旧版 `database.url` 在 `database.dsn` 为空时仍作为 deprecated alias 兼容读取。当前只支持 GitHub.com，不支持 GitHub Enterprise Server。GitHub 鉴权可以使用 GitHub App、PAT token 或 basic auth，但只能三选一。
 
 最小可用配置示例：
 
@@ -21,7 +21,7 @@ server:
 
 database:
   backend: sqlite
-  url: ./var/runnerd.db
+  dsn: ./var/runnerd.db
 
 auth:
   session_secret: <random session signing secret>
@@ -58,7 +58,15 @@ worker:
 
 Runner spec、runner group 和 repository policy 不在 `runnerd.yaml` 中配置；服务启动后通过后台页面或 admin API 创建。spec 名称建议使用有意义的名字，例如 `ubuntu-24-04`，`template_id` 填对应的 E2B template ID。保存 runner spec 前，admin API 会验证该 template 存在且有 usable build。
 
-`database.backend` 支持 `sqlite` 和 `postgres`。本地开发优先使用 sqlite；共享数据库的多实例部署需要先用两个 runnerd 进程验证 lease 行为，再作为正式运行方式记录。
+`database.backend` 支持 `sqlite`、`postgres` 和 `mysql`。本地开发优先使用 sqlite；共享数据库的多实例部署需要先用两个 runnerd 进程验证 lease 行为，再作为正式运行方式记录。
+
+状态表结构主要由 `internal/state/records.go` 里的 GORM tag 定义，服务启动时会先执行少量旧 schema 兼容补列，再运行 GORM `AutoMigrate`。修改 state record、索引或迁移 helper 时，至少先跑：
+
+```bash
+go test ./internal/state -count=1
+```
+
+不要只用全新 sqlite 文件验证迁移；旧 schema 升级路径也需要覆盖，尤其是新增 `NOT NULL` 列、唯一索引或关系约束时。
 
 ## 2. 配置 GitHub 鉴权
 
@@ -130,7 +138,7 @@ cp runnerd.yaml.example runnerd.local.yaml
 task dev
 ```
 
-`task dev` 默认读取 `runnerd.local.yaml`，启动 Vite dev server 到 `127.0.0.1:5173`，并用 `development` build tag 启动 Go 服务。浏览器仍然访问 runnerd 的地址，例如：
+`task dev` 默认读取 `runnerd.local.yaml`，从 `127.0.0.1:5173` 开始选择第一个可用端口启动 Vite dev server，并用 `development` build tag 启动 Go 服务。浏览器仍然访问 runnerd 的地址，例如：
 
 ```text
 http://127.0.0.1:25500/admin/
@@ -140,6 +148,12 @@ http://127.0.0.1:25500/admin/
 
 ```bash
 RUNNERD_CONFIG=./runnerd.yaml task dev
+```
+
+如需固定 Vite 端口：
+
+```bash
+RUNNERD_VITE_PORT=5173 task dev
 ```
 
 生产模式或验证嵌入式前端资源时，直接启动 Go 服务：
