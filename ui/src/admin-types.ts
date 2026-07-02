@@ -12,6 +12,10 @@ export type RunnerState = {
   process_pid?: number
   workflow_job_id?: number
   workflow_run_id?: number
+  workflow_name?: string
+  workflow_run_attempt?: number
+  head_branch?: string
+  head_sha?: string
   github_job_url?: string
   pull_request_number?: number
   assigned_job_id?: number

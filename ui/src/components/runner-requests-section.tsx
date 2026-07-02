@@ -390,7 +390,11 @@ export function RunnerRequestsSection({
                 }
               />
               <Detail label="Workflow run" value={selected.workflow_run_id || "-"} />
+              <Detail label="Workflow" value={selected.workflow_name || "-"} />
+              <Detail label="Workflow attempt" value={selected.workflow_run_attempt || "-"} />
               <Detail label="Pull request" value={selected.pull_request_number || "-"} />
+              <Detail label="Branch" value={selected.head_branch || "-"} />
+              <Detail label="Commit" value={selected.head_sha || "-"} />
               <Detail label="Created" value={formatTime(selected.created_at)} />
               <Detail label="Updated" value={formatTime(selected.updated_at)} />
               <Detail label="Completed" value={formatTime(selected.completed_at)} />

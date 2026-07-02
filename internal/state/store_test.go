@@ -1327,11 +1327,15 @@ func TestAuditEventsCanBeListed(t *testing.T) {
 }
 
 func TestRunnerStateDerivesGitHubJobLinkFromWorkflowJobPayload(t *testing.T) {
-	store := New(t.TempDir())
+	store := New(t.TempDir()).(*DBStore)
 	payload := []byte(`{
 		"workflow_job": {
 			"id": 77684492230,
 			"run_id": 26392225417,
+			"workflow_name": "CI",
+			"run_attempt": 2,
+			"head_branch": "feature/group-jobs",
+			"head_sha": "abc123def456",
 			"html_url": "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230",
 			"pull_requests": [{"number": 3335}]
 		}
@@ -1351,9 +1355,33 @@ func TestRunnerStateDerivesGitHubJobLinkFromWorkflowJobPayload(t *testing.T) {
 	if st.WorkflowRunID != 26392225417 || st.WorkflowJobID != 77684492230 || st.PullRequestNumber != 3335 {
 		t.Fatalf("unexpected github metadata: %#v", st)
 	}
+	if st.WorkflowName != "CI" || st.WorkflowRunAttempt != 2 || st.HeadBranch != "feature/group-jobs" || st.HeadSHA != "abc123def456" {
+		t.Fatalf("unexpected github context: %#v", st)
+	}
 	wantURL := "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230?pr=3335"
 	if st.GitHubJobURL != wantURL {
 		t.Fatalf("unexpected github job url: %q", st.GitHubJobURL)
+	}
+
+	db, err := store.dbOrEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record runnerRequestRecord
+	if err := db.First(&record, "id = ?", "77684492230").Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.WorkflowRunID != 26392225417 || record.WorkflowName != "CI" || record.WorkflowRunAttempt != 2 {
+		t.Fatalf("expected github context to be persisted on runner_requests: %#v", record)
+	}
+	if record.HeadBranch != "feature/group-jobs" || record.HeadSHA != "abc123def456" || record.PullRequestNumber != 3335 {
+		t.Fatalf("expected grouping fields to be persisted on runner_requests: %#v", record)
+	}
+	if record.GitHubJobURL != wantURL {
+		t.Fatalf("expected github job url to be persisted, got %q", record.GitHubJobURL)
+	}
+	if !record.GitHubContextBackfilled {
+		t.Fatalf("expected github context backfill marker to be persisted")
 	}
 }
 
@@ -1380,5 +1408,171 @@ func TestRunnerStateBuildsGitHubJobLinkFromWorkflowRunPayload(t *testing.T) {
 	wantURL := "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230?pr=3335"
 	if st.WorkflowRunID != 26392225417 || st.GitHubJobURL != wantURL {
 		t.Fatalf("unexpected github metadata: %#v", st)
+	}
+}
+
+func TestRunnerStateUsesBackfilledGitHubContextWithoutParsingPayload(t *testing.T) {
+	workflowJobID := int64(77684492230)
+	st := recordToState(runnerRequestRecord{
+		ID:                      "77684492230",
+		Source:                  "github",
+		WorkflowJobID:           &workflowJobID,
+		GitHubInstallationID:    42,
+		WorkflowRunID:           26392225417,
+		WorkflowName:            "CI",
+		WorkflowRunAttempt:      2,
+		HeadBranch:              "feature/group-jobs",
+		HeadSHA:                 "abc123def456",
+		GitHubJobURL:            "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230",
+		PullRequestNumber:       3335,
+		GitHubContextBackfilled: true,
+		RepositoryFullName:      "qbox/las",
+		RequestedLabelsJSON:     `["self-hosted"]`,
+		LabelsJSON:              `["self-hosted"]`,
+		RunnerName:              "e2b-77684492230",
+		Status:                  StatusQueued,
+		GitHubPayloadJSON:       `{"workflow_job":{"run_id":111,"workflow_name":"stale","run_attempt":9,"head_branch":"stale","head_sha":"stale","pull_requests":[{"number":1}]}}`,
+	})
+	if st.WorkflowRunID != 26392225417 || st.WorkflowName != "CI" || st.WorkflowRunAttempt != 2 {
+		t.Fatalf("expected state to use denormalized github context, got %#v", st)
+	}
+	if st.HeadBranch != "feature/group-jobs" || st.HeadSHA != "abc123def456" || st.PullRequestNumber != 3335 {
+		t.Fatalf("expected state to use denormalized grouping fields, got %#v", st)
+	}
+	wantURL := "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230?pr=3335"
+	if st.GitHubJobURL != wantURL {
+		t.Fatalf("expected denormalized github job url, got %q", st.GitHubJobURL)
+	}
+}
+
+func TestMigrateBackfillsLegacyRunnerRequestGitHubContext(t *testing.T) {
+	dir := t.TempDir()
+	databaseURL := dir + "/runnerd.db"
+	store := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: false,
+	}).(*DBStore)
+	db, err := store.open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := db.Exec(`CREATE TABLE runner_requests (
+		id TEXT PRIMARY KEY,
+		source TEXT NOT NULL,
+		workflow_job_id INTEGER,
+		github_installation_id INTEGER,
+		repository_full_name TEXT,
+		requested_labels_json TEXT,
+		labels_json TEXT NOT NULL,
+		profile_name TEXT,
+		runner_group TEXT,
+		runner_name TEXT NOT NULL,
+		status TEXT NOT NULL,
+		failure_stage TEXT,
+		failure_reason TEXT,
+		last_error_code TEXT,
+		last_error_message TEXT,
+		last_error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		sandbox_id TEXT,
+		process_pid INTEGER,
+		assigned_job_id INTEGER,
+		assigned_job_name TEXT,
+		error TEXT,
+		github_payload_json TEXT,
+		queued_at TIMESTAMP NOT NULL,
+		last_attempt_at TIMESTAMP,
+		next_retry_at TIMESTAMP,
+		creating_at TIMESTAMP,
+		running_at TIMESTAMP,
+		stopping_at TIMESTAMP,
+		completed_at TIMESTAMP,
+		failed_at TIMESTAMP,
+		lease_owner TEXT,
+		lease_expires_at TIMESTAMP,
+		updated_at TIMESTAMP NOT NULL,
+		version INTEGER NOT NULL DEFAULT 0
+	);`).Error; err != nil {
+		t.Fatal(err)
+	}
+	payload := `{"workflow_job":{"run_id":26392225417,"workflow_name":"CI","run_attempt":2,"head_branch":"feature/group-jobs","head_sha":"abc123def456","pull_requests":[{"number":3335}]}}`
+	if err := db.Exec(`INSERT INTO runner_requests (
+		id, source, workflow_job_id, github_installation_id, repository_full_name,
+		requested_labels_json, labels_json, runner_name, status, github_payload_json,
+		queued_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"77684492230", "github", 77684492230, 42, "qbox/las",
+		`["self-hosted"]`, `["self-hosted"]`, "e2b-77684492230", StatusQueued, payload,
+		now, now).Error; err != nil {
+		t.Fatal(err)
+	}
+	closeTestDB(t, db)
+
+	migrated := NewWithOptions(Options{
+		Backend:        BackendSQLite,
+		DatabaseDSN:    databaseURL,
+		MigrateOnStart: true,
+	}).(*DBStore)
+	states, err := migrated.ListStatesForGitHubInstallations([]int64{42}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(states) != 1 {
+		t.Fatalf("expected one migrated runner request, got %d", len(states))
+	}
+	st := states[0]
+	if st.WorkflowRunID != 26392225417 || st.PullRequestNumber != 3335 {
+		t.Fatalf("expected github context after migration, got %#v", st)
+	}
+	if st.WorkflowName != "CI" || st.WorkflowRunAttempt != 2 || st.HeadBranch != "feature/group-jobs" || st.HeadSHA != "abc123def456" {
+		t.Fatalf("unexpected github context after migration: %#v", st)
+	}
+
+	db, err = migrated.dbOrEnsure()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{
+		"workflow_run_id",
+		"workflow_name",
+		"workflow_run_attempt",
+		"head_branch",
+		"head_sha",
+		"github_job_url",
+		"pull_request_number",
+		"github_context_backfilled",
+	} {
+		if !db.Migrator().HasColumn(&runnerRequestRecord{}, column) {
+			t.Fatalf("expected migrated runner_requests.%s column", column)
+		}
+	}
+	var record runnerRequestRecord
+	if err := db.First(&record, "id = ?", "77684492230").Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.WorkflowRunID != 26392225417 || record.PullRequestNumber != 3335 {
+		t.Fatalf("expected migrated runner request columns to be backfilled: %#v", record)
+	}
+	if record.WorkflowName != "CI" || record.WorkflowRunAttempt != 2 || record.HeadBranch != "feature/group-jobs" || record.HeadSHA != "abc123def456" {
+		t.Fatalf("unexpected backfilled runner request columns: %#v", record)
+	}
+	wantURL := "https://github.com/qbox/las/actions/runs/26392225417/job/77684492230?pr=3335"
+	if record.GitHubJobURL != wantURL {
+		t.Fatalf("expected github job url to be backfilled, got %q", record.GitHubJobURL)
+	}
+	if !record.GitHubContextBackfilled {
+		t.Fatalf("expected github context backfill marker to be set")
+	}
+	var pendingBackfills int64
+	if err := db.Model(&runnerRequestRecord{}).
+		Where("github_payload_json <> ''").
+		Where("github_context_backfilled IS NULL OR github_context_backfilled = ?", false).
+		Count(&pendingBackfills).Error; err != nil {
+		t.Fatal(err)
+	}
+	if pendingBackfills != 0 {
+		t.Fatalf("expected no pending github context backfills, got %d", pendingBackfills)
 	}
 }

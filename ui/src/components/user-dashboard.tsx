@@ -1,12 +1,30 @@
-import { BookOpen, Github, LogOut, Monitor, Moon, Settings, ShieldCheck, Sun, Workflow } from "lucide-react"
+import {
+  AlertCircle,
+  BookOpen,
+  CalendarDays,
+  ChevronDown,
+  Check,
+  ExternalLink,
+  Github,
+  LogOut,
+  Monitor,
+  Moon,
+  Play,
+  Settings,
+  ShieldCheck,
+  Sun,
+  Workflow,
+  X,
+} from "lucide-react"
 import { useTheme } from "next-themes"
-import { type MouseEvent, useEffect, useMemo, useState } from "react"
+import { type MouseEvent, type ReactNode, useEffect, useMemo, useState } from "react"
 
 import type { AuthSession, GitHubAppConfig, RunnerState } from "@/admin-types"
 import { formatTime } from "@/admin-format"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -17,16 +35,24 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { cn } from "@/lib/utils"
 
-type PRGroup = {
+type BuildGroupKind = "pull_request" | "branch" | "workflow_run" | "manual"
+type RunnerStatusSummary = "completed" | "active" | "failed"
+
+type BuildGroup = {
   key: string
+  kind: BuildGroupKind
   repository: string
-  prLabel: string
+  title: string
+  subtitle: string
   updatedAt: string
   jobs: RunnerState[]
+  workflowRunIDs: number[]
+  headSHA?: string
+  headBranch?: string
+  pullRequestNumber?: number
 }
 
 type UserPage = "home" | "repositories" | "settings"
@@ -65,7 +91,7 @@ export function UserDashboard({
   onSelectKey: (key: string) => void
   onSignOut: () => void
 }) {
-  const groups = useMemo(() => groupRunnersByPR(runners), [runners])
+  const groups = useMemo(() => groupRunnersByBuildContext(runners), [runners])
   const selected = groups.find((group) => group.key === selectedKey) || groups[0]
   const installations = useMemo(
     () => orderInstallationsByCurrentAccount(githubApp?.installations ?? [], authSession.login),
@@ -159,16 +185,6 @@ function ActivityRepositoriesPage({
 }) {
   const [selectedID, setSelectedID] = useState<number | null>(null)
   const selected = installations.find((installation) => installation.id === selectedID) || installations[0]
-
-  useEffect(() => {
-    if (!selected) {
-      setSelectedID(null)
-      return
-    }
-    if (selectedID !== selected.id) {
-      setSelectedID(selected.id)
-    }
-  }, [selected, selectedID])
 
   return (
     <>
@@ -467,12 +483,15 @@ function PullRequestsPage({
   onSelectKey,
   onNavigate,
 }: {
-  groups: PRGroup[]
+  groups: BuildGroup[]
   hasInstallations: boolean
-  selected: PRGroup | undefined
+  selected: BuildGroup | undefined
   onSelectKey: (key: string) => void
   onNavigate: (page: UserPage) => void
 }) {
+  const currentJobs = selected ? currentBuildJobs(selected) : []
+  const previousJobs = selected ? previousBuildJobs(selected, currentJobs) : []
+
   return (
     <>
       <section className="border-b bg-muted/35 px-4 py-4 lg:px-6">
@@ -490,25 +509,12 @@ function PullRequestsPage({
             <div className="min-h-0 flex-1 overflow-y-auto">
               {groups.length ? (
                 groups.map((group) => (
-                  <button
+                  <BuildGroupListItem
                     key={group.key}
-                    type="button"
-                    onClick={() => onSelectKey(group.key)}
-                    className={cn(
-                      "flex w-full flex-col gap-2 border-b px-4 py-3 text-left transition-colors hover:bg-accent",
-                      selected?.key === group.key ? "bg-accent" : ""
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      <Workflow className="h-4 w-4 text-primary" />
-                      <span className="truncate text-sm font-semibold">{group.prLabel}</span>
-                    </div>
-                    <div className="truncate text-xs text-muted-foreground">{group.repository}</div>
-                    <div className="flex items-center gap-2">
-                      <Badge variant="secondary">{group.jobs.length} jobs</Badge>
-                      <span className="text-xs text-muted-foreground">{formatTime(group.updatedAt)}</span>
-                    </div>
-                  </button>
+                    group={group}
+                    selected={selected?.key === group.key}
+                    onSelect={() => onSelectKey(group.key)}
+                  />
                 ))
               ) : (
                 <div className="p-4 text-sm text-muted-foreground">
@@ -533,36 +539,39 @@ function PullRequestsPage({
           {selected ? (
             <div className="space-y-4">
               <div>
-                <div className="text-sm text-muted-foreground">{selected.repository}</div>
-                <h2 className="text-2xl font-semibold">{selected.prLabel}</h2>
+                <h2 className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-2xl font-semibold">
+                  <span>{selected.repository}</span>
+                  <span className={userBuildGroupTitleClass(selected)}>{selected.title}</span>
+                </h2>
+                <div className="mt-3 grid gap-3 text-sm sm:grid-cols-2 xl:grid-cols-4">
+                  <JobField label="Branch" value={selected.headBranch || selected.subtitle || "unknown"} />
+                  <JobField label="Commit" value={shortSHA(selected.headSHA) || "unknown"} />
+                  <JobField label="Workflow runs" value={String(selected.workflowRunIDs.length || 1)} />
+                  <JobField label="Last updated" value={formatTime(selected.updatedAt)} />
+                </div>
               </div>
               <div className="grid gap-3">
-                {selected.jobs.map((job) => (
-                  <Card key={job.id} className="rounded-lg">
-                    <CardHeader className="gap-3 pb-3">
-                      <div className="flex flex-wrap items-start justify-between gap-3">
-                        <div>
-                          <CardTitle className="text-base">{job.assigned_job_name || job.runner_name}</CardTitle>
-                          <CardDescription>{job.id}</CardDescription>
-                        </div>
-                        <Badge className={userStatusClass(job.status)}>{job.status}</Badge>
-                      </div>
-                    </CardHeader>
-                    <CardContent className="grid gap-3 text-sm md:grid-cols-3">
-                      <JobField label="Runner spec" value={job.runner_spec_name || "matched by labels"} />
-                      <JobField label="Workflow run" value={job.workflow_run_id ? String(job.workflow_run_id) : "unknown"} />
-                      <JobField label="Updated" value={formatTime(job.updated_at)} />
-                      {job.github_job_url ? (
-                        <>
-                          <Separator className="md:col-span-3" />
-                          <a className="text-sm font-medium text-primary hover:underline md:col-span-3" href={job.github_job_url}>
-                            Open GitHub Actions job
-                          </a>
-                        </>
-                      ) : null}
-                    </CardContent>
-                  </Card>
+                {currentJobs.map((job) => (
+                  <RunnerJobCard key={job.id} job={job} />
                 ))}
+                {previousJobs.length ? (
+                  <Collapsible>
+                    <CollapsibleTrigger asChild>
+                      <Button type="button" variant="outline" className="w-full justify-between">
+                        Previous jobs
+                        <span className="inline-flex items-center gap-2 text-muted-foreground">
+                          {previousJobs.length} jobs
+                          <ChevronDown className="h-4 w-4" />
+                        </span>
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="mt-3 grid gap-3">
+                      {previousJobs.map((job) => (
+                        <RunnerJobCard key={job.id} job={job} />
+                      ))}
+                    </CollapsibleContent>
+                  </Collapsible>
+                ) : null}
               </div>
             </div>
           ) : (
@@ -655,7 +664,7 @@ function UserMenu({ authSession, onSignOut }: { authSession: AuthSession; onSign
   )
 }
 
-function JobField({ label, value }: { label: string; value: string }) {
+function JobField({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div>
       <div className="text-xs text-muted-foreground">{label}</div>
@@ -664,27 +673,294 @@ function JobField({ label, value }: { label: string; value: string }) {
   )
 }
 
-function groupRunnersByPR(runners: RunnerState[]): PRGroup[] {
-  const groups = new Map<string, PRGroup>()
+function RunnerJobCard({ job }: { job: RunnerState }) {
+  return (
+    <Card className="rounded-lg">
+      <CardHeader className="gap-1 pb-0">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <CardTitle className="text-base">{runnerJobTitle(job)}</CardTitle>
+          </div>
+          <Badge className={userStatusClass(job.status)}>{job.status}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-3 pt-0 text-sm md:grid-cols-3">
+        <JobField label="Runner spec" value={job.runner_spec_name || "matched by labels"} />
+        <JobField label="Workflow" value={job.workflow_name || "unknown"} />
+        <JobField label="Workflow run" value={workflowRunValue(job)} />
+      </CardContent>
+    </Card>
+  )
+}
+
+function workflowRunValue(job: RunnerState) {
+  const runID = job.workflow_run_id ? String(job.workflow_run_id) : "unknown"
+  const jobID = job.workflow_job_id ? String(job.workflow_job_id) : job.id
+  const runURL = workflowRunURL(job)
+  const runValue = runURL ? (
+    <a className="text-primary hover:underline" href={runURL} target="_blank" rel="noreferrer">
+      {runID}
+    </a>
+  ) : (
+    runID
+  )
+  if (!job.github_job_url || !jobID) return runValue
+  return (
+    <span className="inline-flex items-center gap-1">
+      {runValue}
+      <span className="text-muted-foreground">/</span>
+      <a className="inline-flex items-center gap-1 text-primary hover:underline" href={job.github_job_url} target="_blank" rel="noreferrer">
+        {jobID}
+        <ExternalLink className="h-3.5 w-3.5" />
+      </a>
+    </span>
+  )
+}
+
+function workflowRunURL(job: RunnerState) {
+  if (!job.github_job_url || !job.workflow_run_id) return ""
+  const marker = `/actions/runs/${job.workflow_run_id}`
+  const index = job.github_job_url.indexOf(marker)
+  if (index < 0) return ""
+  return job.github_job_url.slice(0, index + marker.length)
+}
+
+function BuildGroupListItem({
+  group,
+  selected,
+  onSelect,
+}: {
+  group: BuildGroup
+  selected: boolean
+  onSelect: () => void
+}) {
+  const status = buildGroupStatus(group)
+  const statusClasses = buildGroupStatusClasses(status)
+  const reference = buildGroupReference(group)
+
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={cn(
+        "group relative flex w-full gap-2 border-b bg-background/60 py-4 pl-3 pr-4 text-left transition-colors hover:bg-accent/70",
+        selected ? "bg-accent" : ""
+      )}
+    >
+      <span className={cn("absolute inset-y-0 left-0 w-1", statusClasses.bar)} aria-hidden="true" />
+      <span className={cn("mt-1 flex h-5 w-5 shrink-0 items-center justify-center", statusClasses.icon)}>
+        <BuildGroupStatusIcon status={status} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-start justify-between gap-3">
+          <span className="min-w-0 flex-1">
+            <span className={cn("block truncate text-sm font-semibold leading-5", statusClasses.title)}>
+              {group.repository}
+            </span>
+          </span>
+          <span className="flex shrink-0 items-baseline gap-1 font-mono text-sm leading-5">
+            <span className="text-muted-foreground">#</span>
+            <span className={cn("text-sm font-semibold", statusClasses.title)}>{reference}</span>
+          </span>
+        </span>
+        <span className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span className="inline-flex items-center gap-1">
+            <Workflow className="h-3.5 w-3.5" />
+            {group.jobs.length} jobs
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <Play className="h-3.5 w-3.5" />
+            {group.workflowRunIDs.length || 1} runs
+          </span>
+          <span className="inline-flex items-center gap-1">
+            <CalendarDays className="h-3.5 w-3.5" />
+            {formatTime(group.updatedAt)}
+          </span>
+        </span>
+      </span>
+    </button>
+  )
+}
+
+function userBuildGroupTitleClass(group: BuildGroup) {
+  return buildGroupStatusClasses(buildGroupStatus(group)).title
+}
+
+function BuildGroupStatusIcon({ status }: { status: RunnerStatusSummary }) {
+  const className = "h-4 w-4"
+  if (status === "failed") return <X className={className} />
+  if (status === "active") return <AlertCircle className={className} />
+  return <Check className={className} />
+}
+
+function buildGroupStatus(group: BuildGroup): RunnerStatusSummary {
+  if (group.jobs.some((job) => job.status === "failed")) return "failed"
+  if (group.jobs.some((job) => job.status === "queued" || job.status === "creating" || job.status === "running" || job.status === "stopping")) {
+    return "active"
+  }
+  return "completed"
+}
+
+function buildGroupStatusClasses(status: RunnerStatusSummary) {
+  switch (status) {
+    case "failed":
+      return {
+        bar: "bg-destructive",
+        icon: "text-destructive",
+        title: "text-destructive",
+      }
+    case "active":
+      return {
+        bar: "bg-blue-500",
+        icon: "text-blue-500",
+        title: "text-blue-500",
+      }
+    default:
+      return {
+        bar: "bg-emerald-500",
+        icon: "text-emerald-500",
+        title: "text-emerald-500",
+      }
+  }
+}
+
+function buildGroupReference(group: BuildGroup) {
+  if (group.pullRequestNumber) return String(group.pullRequestNumber)
+  if (group.headSHA) return shortSHA(group.headSHA)
+  if (group.workflowRunIDs[0]) return String(group.workflowRunIDs[0])
+  return String(group.jobs.length)
+}
+
+function runnerJobTitle(job: RunnerState) {
+  if (job.assigned_job_name && job.assigned_job_name !== "__runner_job_started__") {
+    return job.assigned_job_name
+  }
+  return job.workflow_name || job.runner_name
+}
+
+function groupRunnersByBuildContext(runners: RunnerState[]): BuildGroup[] {
+  const prByRepositoryAndSHA = new Map<string, number>()
+  for (const runner of runners) {
+    if (runner.repository_full_name && runner.head_sha && runner.pull_request_number) {
+      prByRepositoryAndSHA.set(`${runner.repository_full_name}:${runner.head_sha}`, runner.pull_request_number)
+    }
+  }
+
+  const groups = new Map<string, BuildGroup>()
   for (const runner of runners) {
     const repository = runner.repository_full_name || "unknown/repository"
-    const pr = runner.pull_request_number ? `PR #${runner.pull_request_number}` : "Manual or workflow job"
-    const key = `${repository}:${runner.pull_request_number || runner.workflow_run_id || runner.id}`
+    const inferredPR = runner.pull_request_number || (runner.head_sha ? prByRepositoryAndSHA.get(`${repository}:${runner.head_sha}`) : undefined)
+    const group = buildGroupSeed(runner, repository, inferredPR)
+    const key = group.key
     const current = groups.get(key)
     if (current) {
       current.jobs.push(runner)
-      if (runner.updated_at > current.updatedAt) current.updatedAt = runner.updated_at
+      if (runner.updated_at > current.updatedAt) {
+        current.updatedAt = runner.updated_at
+        current.subtitle = group.subtitle
+        current.headSHA = runner.head_sha || current.headSHA
+        current.headBranch = runner.head_branch || current.headBranch
+      }
+      if (runner.head_sha && !current.headSHA) current.headSHA = runner.head_sha
+      if (runner.head_branch && !current.headBranch) current.headBranch = runner.head_branch
+      if (runner.workflow_run_id && !current.workflowRunIDs.includes(runner.workflow_run_id)) {
+        current.workflowRunIDs.push(runner.workflow_run_id)
+        current.workflowRunIDs.sort((a, b) => b - a)
+      }
       continue
     }
-    groups.set(key, {
-      key,
+    groups.set(key, group)
+  }
+  return Array.from(groups.values())
+    .map((group) => ({ ...group, jobs: orderJobs(group.jobs) }))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+}
+
+function buildGroupSeed(runner: RunnerState, repository: string, pullRequestNumber?: number): BuildGroup {
+  const workflowRunIDs = runner.workflow_run_id ? [runner.workflow_run_id] : []
+  if (pullRequestNumber) {
+    return {
+      key: `pr:${repository}:${pullRequestNumber}`,
+      kind: "pull_request",
       repository,
-      prLabel: pr,
+      title: `PR #${pullRequestNumber}`,
+      subtitle: runner.head_branch || shortSHA(runner.head_sha) || runner.workflow_name || "Pull request checks",
       updatedAt: runner.updated_at,
       jobs: [runner],
-    })
+      workflowRunIDs,
+      headSHA: runner.head_sha,
+      headBranch: runner.head_branch,
+      pullRequestNumber,
+    }
   }
-  return Array.from(groups.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+  if (runner.head_sha) {
+    const branch = runner.head_branch || "detached"
+    return {
+      key: `branch:${repository}:${branch}:${runner.head_sha}`,
+      kind: "branch",
+      repository,
+      title: runner.head_branch || `Commit ${shortSHA(runner.head_sha)}`,
+      subtitle: shortSHA(runner.head_sha) || runner.workflow_name || "Branch checks",
+      updatedAt: runner.updated_at,
+      jobs: [runner],
+      workflowRunIDs,
+      headSHA: runner.head_sha,
+      headBranch: runner.head_branch,
+    }
+  }
+  if (runner.workflow_run_id) {
+    return {
+      key: `run:${repository}:${runner.workflow_run_id}`,
+      kind: "workflow_run",
+      repository,
+      title: runner.workflow_name || "Workflow run",
+      subtitle: `Run ${runner.workflow_run_id}`,
+      updatedAt: runner.updated_at,
+      jobs: [runner],
+      workflowRunIDs,
+    }
+  }
+  return {
+    key: `manual:${repository}:${runner.id}`,
+    kind: "manual",
+    repository,
+    title: "Manual runner",
+    subtitle: runner.runner_spec_name || runner.runner_name || runner.id,
+    updatedAt: runner.updated_at,
+    jobs: [runner],
+    workflowRunIDs,
+  }
+}
+
+function orderJobs(jobs: RunnerState[]) {
+  return [...jobs].sort((a, b) => {
+    const runOrder = (b.workflow_run_id || 0) - (a.workflow_run_id || 0)
+    if (runOrder !== 0) return runOrder
+    return b.updated_at.localeCompare(a.updated_at)
+  })
+}
+
+function currentBuildJobs(group: BuildGroup) {
+  if (group.headSHA) {
+    const current = group.jobs.filter((job) => job.head_sha === group.headSHA)
+    if (current.length > 0) return current
+  }
+  const latestRunID = group.workflowRunIDs[0]
+  if (latestRunID) {
+    const current = group.jobs.filter((job) => job.workflow_run_id === latestRunID)
+    if (current.length > 0) return current
+  }
+  return group.jobs
+}
+
+function previousBuildJobs(group: BuildGroup, currentJobs: RunnerState[]) {
+  const currentIDs = new Set(currentJobs.map((job) => job.id))
+  return group.jobs.filter((job) => !currentIDs.has(job.id))
+}
+
+function shortSHA(value?: string) {
+  if (!value) return ""
+  return value.length > 7 ? value.slice(0, 7) : value
 }
 
 function orderInstallationsByCurrentAccount(
@@ -769,7 +1045,7 @@ function userStatusClass(status: RunnerState["status"]) {
     case "completed":
       return "bg-muted text-foreground"
     case "failed":
-      return "bg-destructive text-destructive-foreground"
+      return "bg-destructive text-white"
     default:
       return ""
   }

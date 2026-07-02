@@ -39,7 +39,7 @@ func recordToRequest(record runnerRequestRecord) (RunnerRequest, error) {
 
 func recordToState(record runnerRequestRecord) RunnerState {
 	requestedLabels, _ := labelsFromJSON(record.RequestedLabelsJSON)
-	githubLinks := githubLinksFromPayload(record)
+	githubLinks := githubLinksFromRecord(record)
 	return RunnerState{
 		ID:                   record.ID,
 		Status:               record.Status,
@@ -53,6 +53,10 @@ func recordToState(record runnerRequestRecord) RunnerState {
 		ProcessPID:           record.ProcessPID,
 		WorkflowJobID:        pointerToInt64(record.WorkflowJobID),
 		WorkflowRunID:        githubLinks.workflowRunID,
+		WorkflowName:         githubLinks.workflowName,
+		WorkflowRunAttempt:   githubLinks.workflowRunAttempt,
+		HeadBranch:           githubLinks.headBranch,
+		HeadSHA:              githubLinks.headSHA,
 		GitHubJobURL:         githubLinks.jobURL,
 		PullRequestNumber:    githubLinks.pullRequestNumber,
 		AssignedJobID:        record.AssignedJobID,
@@ -79,10 +83,65 @@ func recordToState(record runnerRequestRecord) RunnerState {
 	}
 }
 
+func githubLinksFromRecord(record runnerRequestRecord) githubPayloadLinks {
+	links := githubPayloadLinks{
+		workflowRunID:      record.WorkflowRunID,
+		workflowName:       record.WorkflowName,
+		workflowRunAttempt: record.WorkflowRunAttempt,
+		headBranch:         record.HeadBranch,
+		headSHA:            record.HeadSHA,
+		jobURL:             record.GitHubJobURL,
+		pullRequestNumber:  record.PullRequestNumber,
+	}
+	if !record.GitHubContextBackfilled {
+		links = mergeGitHubPayloadLinks(links, githubLinksFromPayload(record))
+	}
+	if links.jobURL == "" && record.RepositoryFullName != "" && links.workflowRunID > 0 {
+		jobID := record.AssignedJobID
+		if jobID == 0 {
+			jobID = pointerToInt64(record.WorkflowJobID)
+		}
+		if jobID > 0 {
+			links.jobURL = fmt.Sprintf("https://github.com/%s/actions/runs/%d/job/%d", record.RepositoryFullName, links.workflowRunID, jobID)
+		}
+	}
+	links.jobURL = appendPullRequestQuery(links.jobURL, links.pullRequestNumber)
+	return links
+}
+
+func mergeGitHubPayloadLinks(links githubPayloadLinks, fallback githubPayloadLinks) githubPayloadLinks {
+	if links.workflowRunID == 0 {
+		links.workflowRunID = fallback.workflowRunID
+	}
+	if links.workflowName == "" {
+		links.workflowName = fallback.workflowName
+	}
+	if links.workflowRunAttempt == 0 {
+		links.workflowRunAttempt = fallback.workflowRunAttempt
+	}
+	if links.headBranch == "" {
+		links.headBranch = fallback.headBranch
+	}
+	if links.headSHA == "" {
+		links.headSHA = fallback.headSHA
+	}
+	if links.jobURL == "" {
+		links.jobURL = fallback.jobURL
+	}
+	if links.pullRequestNumber == 0 {
+		links.pullRequestNumber = fallback.pullRequestNumber
+	}
+	return links
+}
+
 type githubPayloadLinks struct {
-	workflowRunID     int64
-	jobURL            string
-	pullRequestNumber int64
+	workflowRunID      int64
+	workflowName       string
+	workflowRunAttempt int64
+	headBranch         string
+	headSHA            string
+	jobURL             string
+	pullRequestNumber  int64
 }
 
 type githubPayloadPullRequest struct {
@@ -93,6 +152,10 @@ func githubLinksFromPayload(record runnerRequestRecord) githubPayloadLinks {
 	var payload struct {
 		WorkflowJob struct {
 			RunID        int64                      `json:"run_id"`
+			WorkflowName string                     `json:"workflow_name"`
+			RunAttempt   int64                      `json:"run_attempt"`
+			HeadBranch   string                     `json:"head_branch"`
+			HeadSHA      string                     `json:"head_sha"`
 			HTMLURL      string                     `json:"html_url"`
 			PullRequests []githubPayloadPullRequest `json:"pull_requests"`
 			WorkflowRun  struct {
@@ -101,6 +164,10 @@ func githubLinksFromPayload(record runnerRequestRecord) githubPayloadLinks {
 		} `json:"workflow_job"`
 		WorkflowRun struct {
 			ID           int64                      `json:"id"`
+			Name         string                     `json:"name"`
+			RunAttempt   int64                      `json:"run_attempt"`
+			HeadBranch   string                     `json:"head_branch"`
+			HeadSHA      string                     `json:"head_sha"`
 			HTMLURL      string                     `json:"html_url"`
 			PullRequests []githubPayloadPullRequest `json:"pull_requests"`
 		} `json:"workflow_run"`
@@ -119,6 +186,13 @@ func githubLinksFromPayload(record runnerRequestRecord) githubPayloadLinks {
 	if runID == 0 {
 		runID = payload.WorkflowRun.ID
 	}
+	workflowName := firstNonEmpty(payload.WorkflowJob.WorkflowName, payload.WorkflowRun.Name)
+	runAttempt := payload.WorkflowJob.RunAttempt
+	if runAttempt == 0 {
+		runAttempt = payload.WorkflowRun.RunAttempt
+	}
+	headBranch := firstNonEmpty(payload.WorkflowJob.HeadBranch, payload.WorkflowRun.HeadBranch)
+	headSHA := firstNonEmpty(payload.WorkflowJob.HeadSHA, payload.WorkflowRun.HeadSHA)
 
 	prNumber := firstPullRequestNumber(payload.WorkflowJob.PullRequests)
 	if prNumber == 0 {
@@ -139,10 +213,24 @@ func githubLinksFromPayload(record runnerRequestRecord) githubPayloadLinks {
 	jobURL = appendPullRequestQuery(jobURL, prNumber)
 
 	return githubPayloadLinks{
-		workflowRunID:     runID,
-		jobURL:            jobURL,
-		pullRequestNumber: prNumber,
+		workflowRunID:      runID,
+		workflowName:       workflowName,
+		workflowRunAttempt: runAttempt,
+		headBranch:         headBranch,
+		headSHA:            headSHA,
+		jobURL:             jobURL,
+		pullRequestNumber:  prNumber,
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func firstPullRequestNumber(pulls []githubPayloadPullRequest) int64 {

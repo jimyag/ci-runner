@@ -53,6 +53,10 @@ type RunnerState struct {
 	ProcessPID           uint32    `json:"process_pid,omitempty"`
 	WorkflowJobID        int64     `json:"workflow_job_id,omitempty"`
 	WorkflowRunID        int64     `json:"workflow_run_id,omitempty"`
+	WorkflowName         string    `json:"workflow_name,omitempty"`
+	WorkflowRunAttempt   int64     `json:"workflow_run_attempt,omitempty"`
+	HeadBranch           string    `json:"head_branch,omitempty"`
+	HeadSHA              string    `json:"head_sha,omitempty"`
 	GitHubJobURL         string    `json:"github_job_url,omitempty"`
 	PullRequestNumber    int64     `json:"pull_request_number,omitempty"`
 	AssignedJobID        int64     `json:"assigned_job_id,omitempty"`

@@ -44,21 +44,34 @@ func (s *DBStore) CreateRequest(req RunnerRequest, payload []byte) (bool, Runner
 	if err != nil {
 		return false, RunnerState{}, err
 	}
+	payloadLinks := githubLinksFromPayload(runnerRequestRecord{
+		WorkflowJobID:      &req.JobID,
+		RepositoryFullName: req.RepositoryFullName,
+		GitHubPayloadJSON:  string(payload),
+	})
 	record := runnerRequestRecord{
-		ID:                   req.ID,
-		Source:               req.Source,
-		GitHubInstallationID: req.GitHubInstallationID,
-		RepositoryFullName:   req.RepositoryFullName,
-		RequestedLabelsJSON:  string(requestedLabelsJSON),
-		LabelsJSON:           string(labelsJSON),
-		ProfileName:          req.ProfileName,
-		RunnerGroup:          req.RunnerGroup,
-		RunnerName:           req.RunnerName,
-		Status:               StatusQueued,
-		GitHubPayloadJSON:    string(payload),
-		QueuedAt:             req.CreatedAt,
-		UpdatedAt:            now,
-		Version:              0,
+		ID:                      req.ID,
+		Source:                  req.Source,
+		GitHubInstallationID:    req.GitHubInstallationID,
+		WorkflowRunID:           payloadLinks.workflowRunID,
+		WorkflowName:            payloadLinks.workflowName,
+		WorkflowRunAttempt:      payloadLinks.workflowRunAttempt,
+		HeadBranch:              payloadLinks.headBranch,
+		HeadSHA:                 payloadLinks.headSHA,
+		GitHubJobURL:            payloadLinks.jobURL,
+		PullRequestNumber:       payloadLinks.pullRequestNumber,
+		GitHubContextBackfilled: true,
+		RepositoryFullName:      req.RepositoryFullName,
+		RequestedLabelsJSON:     string(requestedLabelsJSON),
+		LabelsJSON:              string(labelsJSON),
+		ProfileName:             req.ProfileName,
+		RunnerGroup:             req.RunnerGroup,
+		RunnerName:              req.RunnerName,
+		Status:                  StatusQueued,
+		GitHubPayloadJSON:       string(payload),
+		QueuedAt:                req.CreatedAt,
+		UpdatedAt:               now,
+		Version:                 0,
 	}
 	if req.JobID != 0 {
 		record.WorkflowJobID = &req.JobID

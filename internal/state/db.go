@@ -15,6 +15,8 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
+const runnerRequestGitHubContextBackfillBatchSize = 200
+
 type DBStore struct {
 	opts     Options
 	mu       sync.Mutex
@@ -165,6 +167,9 @@ func (s *DBStore) migrate(db *gorm.DB) error {
 	); err != nil {
 		return err
 	}
+	if err := backfillRunnerRequestGitHubContext(db); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -190,4 +195,51 @@ func migrateLegacySchemaColumns(db *gorm.DB) error {
 		}
 	}
 	return nil
+}
+
+func backfillRunnerRequestGitHubContext(db *gorm.DB) error {
+	var records []runnerRequestRecord
+	return db.
+		Where("github_payload_json <> ''").
+		Where("github_context_backfilled IS NULL OR github_context_backfilled = ?", false).
+		FindInBatches(&records, runnerRequestGitHubContextBackfillBatchSize, func(tx *gorm.DB, _ int) error {
+			return tx.Transaction(func(batchTx *gorm.DB) error {
+				for _, record := range records {
+					updates := runnerRequestGitHubContextBackfill(record)
+					if err := batchTx.Model(&runnerRequestRecord{}).Where("id = ?", record.ID).Updates(updates).Error; err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}).Error
+}
+
+func runnerRequestGitHubContextBackfill(record runnerRequestRecord) map[string]any {
+	links := githubLinksFromPayload(record)
+	updates := map[string]any{
+		"github_context_backfilled": true,
+	}
+	if record.WorkflowRunID == 0 && links.workflowRunID != 0 {
+		updates["workflow_run_id"] = links.workflowRunID
+	}
+	if record.WorkflowName == "" && links.workflowName != "" {
+		updates["workflow_name"] = links.workflowName
+	}
+	if record.WorkflowRunAttempt == 0 && links.workflowRunAttempt != 0 {
+		updates["workflow_run_attempt"] = links.workflowRunAttempt
+	}
+	if record.HeadBranch == "" && links.headBranch != "" {
+		updates["head_branch"] = links.headBranch
+	}
+	if record.HeadSHA == "" && links.headSHA != "" {
+		updates["head_sha"] = links.headSHA
+	}
+	if record.GitHubJobURL == "" && links.jobURL != "" {
+		updates["github_job_url"] = links.jobURL
+	}
+	if record.PullRequestNumber == 0 && links.pullRequestNumber != 0 {
+		updates["pull_request_number"] = links.pullRequestNumber
+	}
+	return updates
 }
